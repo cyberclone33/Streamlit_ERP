@@ -6,6 +6,7 @@ from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
+from pandas import option_context
 
 # --------------------------------------------------
 # 🔧 CONFIG & CONSTANTS ---------------------------
@@ -176,12 +177,14 @@ def calculate_single_file_summary(df, filename):
 
 def calculate_all_top_products():
     """
-    Calculates combined Top 100 products and augments the table with monthly sales figures.
+    Calculates combined sales for ALL products, merges BC data (inventory, supplier),
+    and augments the table with monthly sales figures.
     """
-    st.session_state.debug_info.append("Calculating Top 100 products with monthly breakdown...")
+    st.session_state.debug_info.append("Calculating ALL products with BC data and monthly breakdown...")
     st.session_state.combined_top_products = None # Reset
 
     product_df_raw = st.session_state.processed_data.get('product_level')
+    bc_data_raw = st.session_state.get('bc_data') # Get BC data
 
     if product_df_raw is None or product_df_raw.empty:
         st.session_state.debug_info.append("  - No product level data available for top products calculation.")
@@ -189,47 +192,125 @@ def calculate_all_top_products():
 
     # --- Create a working copy and ensure numeric types ---
     product_df = product_df_raw.copy()
+    st.session_state.debug_info.append(f"  - Input product_df shape: {product_df.shape}")
+    st.session_state.debug_info.append(f"  - Input product_df columns: {product_df.columns.tolist()}")
     st.session_state.debug_info.append("  - Ensuring numeric types for '數量' and '小計'...")
     try:
+        # Log types before conversion
+        st.session_state.debug_info.append(f"    - '數量' dtype before: {product_df['數量'].dtype}")
+        st.session_state.debug_info.append(f"    - '小計' dtype before: {product_df['小計'].dtype}")
         product_df['數量'] = pd.to_numeric(product_df['數量'], errors='coerce').fillna(0)
         product_df['小計'] = pd.to_numeric(product_df['小計'], errors='coerce').fillna(0)
+        # Log types after conversion
+        st.session_state.debug_info.append(f"    - '數量' dtype after: {product_df['數量'].dtype}")
+        st.session_state.debug_info.append(f"    - '小計' dtype after: {product_df['小計'].dtype}")
         st.session_state.debug_info.append("    - Numeric conversion successful.")
     except Exception as e:
         st.session_state.debug_info.append(f"    - Error converting to numeric: {e}. Aborting top product calculation.")
         return
 
-    # --- Calculate Combined Top 100 ---
-    st.session_state.debug_info.append("  - Calculating combined Top 100...")
-    combined_summary = product_df.groupby(["產品代號", "產品名稱"]).agg(
-        總數量=("數量", "sum"),
-        總金額=("小計", "sum") # Use numeric sum here
-    ).reset_index()
+    # --- Calculate Combined Summary for ALL Products ---
+    st.session_state.debug_info.append("  - Calculating combined summary for ALL products...")
+    st.session_state.debug_info.append(f"    - Grouping by: ['產品代號', '產品名稱']")
+    st.session_state.debug_info.append(f"    - Aggregating: 數量 (sum), 小計 (sum)")
+    try:
+        combined_summary = product_df.groupby(["產品代號", "產品名稱"]).agg(
+            總數量=("數量", "sum"),
+            總金額=("小計", "sum") # Use numeric sum here
+        ).reset_index()
+        st.session_state.debug_info.append(f"    - Combined summary shape after groupby: {combined_summary.shape}")
+    except Exception as e:
+        st.session_state.debug_info.append(f"    - Error during combined summary groupby: {e}. Aborting.")
+        return
 
-    # Sort by total amount (numeric) and get top 100
-    top_100_combined = combined_summary.sort_values("總金額", ascending=False).head(100).copy() # Use copy
-    top_100_combined.insert(0, "排名", range(1, len(top_100_combined) + 1))
-    st.session_state.debug_info.append(f"  - Found {len(top_100_combined)} combined top products.")
+    # Sort by total amount (numeric) - NO LONGER TAKING TOP 100
+    all_products_combined = combined_summary.sort_values("總金額", ascending=False).copy() # Use copy
+    all_products_combined.insert(0, "排名", range(1, len(all_products_combined) + 1))
+    st.session_state.debug_info.append(f"  - Found {len(all_products_combined)} products with sales records.")
+
+    # --- Merge with BC Data (Inventory and Supplier) ---
+    if bc_data_raw is not None and not bc_data_raw.empty:
+        st.session_state.debug_info.append("  - BC data found. Merging inventory and supplier info...")
+        # Select relevant columns and rename '數量' to '庫存'
+        st.session_state.debug_info.append(f"    - BC data shape: {bc_data_raw.shape}")
+        st.session_state.debug_info.append(f"    - BC data columns: {bc_data_raw.columns.tolist()}")
+        bc_subset = bc_data_raw[['產品代號', '數量', '廠商簡稱']].copy()
+        bc_subset = bc_subset.rename(columns={'數量': '庫存'})
+        st.session_state.debug_info.append(f"    - BC subset columns for merge: {bc_subset.columns.tolist()}")
+
+        # Ensure '產品代號' is the same type in both dataframes for merging
+        try:
+             all_products_combined['產品代號'] = all_products_combined['產品代號'].astype(str)
+             bc_subset['產品代號'] = bc_subset['產品代號'].astype(str)
+        except Exception as e:
+             st.session_state.debug_info.append(f"    - Warning: Error converting '產品代號' to string for merge: {e}")
+
+        # Perform the merge
+        all_products_combined = pd.merge(
+            all_products_combined,
+            bc_subset,
+            on='產品代號',
+            how='left'
+        )
+        st.session_state.debug_info.append(f"    - Shape after merging BC data: {all_products_combined.shape}")
+        # Fill missing values from the merge
+        # Clean the '庫存' column first to handle potential commas or non-numeric values
+        st.session_state.debug_info.append("    - Cleaning '庫存' column before converting to int...")
+        all_products_combined['庫存'] = all_products_combined['庫存'].apply(clean_numeric_value)
+        all_products_combined['庫存'] = all_products_combined['庫存'].fillna(0).astype(int) # Fill NaN inventory with 0 and convert to int
+        all_products_combined['廠商簡稱'] = all_products_combined['廠商簡稱'].fillna('N/A') # Fill NaN supplier with 'N/A'
+        st.session_state.debug_info.append("    - Merge with BC data successful.")
+    else:
+        st.session_state.debug_info.append("  - No BC data found or BC data is empty. Skipping merge.")
+        # Add empty columns if BC data is missing, so the table structure is consistent
+        all_products_combined['庫存'] = 0
+        all_products_combined['廠商簡稱'] = 'N/A'
 
     # --- Calculate Monthly Summaries for ALL products ---
     if '年月' not in product_df.columns:
         st.session_state.debug_info.append("  - '年月' column missing, cannot add monthly breakdown.")
-        # Store only the combined top 100 without monthly columns
+        # Store only the combined summary without monthly columns
         # Format the total amount column before storing
-        top_100_combined["總金額_顯示"] = top_100_combined["總金額"].round(2).apply(lambda x: f"{x:,.2f}")
-        st.session_state.combined_top_products = top_100_combined[['排名', '產品代號', '產品名稱', '總數量', '總金額_顯示']].rename(columns={"總金額_顯示": "總金額(元)"})
+        all_products_combined["總金額_顯示"] = all_products_combined["總金額"].round(2).apply(lambda x: f"{x:,.2f}")
+        # Select and reorder columns including BC data before storing
+        core_cols_no_monthly = ['排名', '產品代號', '產品名稱', '廠商簡稱', '庫存', '總數量', '總金額_顯示'] # Added BC cols
+        st.session_state.combined_top_products = all_products_combined[[col for col in core_cols_no_monthly if col in all_products_combined.columns]].rename(columns={"總金額_顯示": "總金額(元)"})
         return
 
     st.session_state.debug_info.append("  - Calculating monthly summaries for all products...")
+    st.session_state.debug_info.append(f"    - Grouping by: ['年月', '產品代號', '產品名稱']")
+    st.session_state.debug_info.append(f"    - Aggregating: 數量 (sum), 小計 (sum)")
     # Use the numeric product_df here
-    monthly_summary = product_df.groupby(['年月', '產品代號', '產品名稱']).agg(
-        月數量=("數量", "sum"),
-        月金額=("小計", "sum")
-    ).reset_index()
-    st.session_state.debug_info.append(f"  - Calculated {len(monthly_summary)} monthly product summaries.")
+    try:
+        monthly_summary = product_df.groupby(['年月', '產品代號', '產品名稱']).agg(
+            月數量=("數量", "sum"),
+            月金額=("小計", "sum")
+        ).reset_index()
+        st.session_state.debug_info.append(f"    - Monthly summary shape after groupby: {monthly_summary.shape}")
+        st.session_state.debug_info.append(f"    - Monthly summary columns: {monthly_summary.columns.tolist()}")
+        st.session_state.debug_info.append(f"    - Calculated {len(monthly_summary)} monthly product summaries.")
+    except Exception as e:
+        st.session_state.debug_info.append(f"    - Error during monthly summary groupby: {e}. Cannot add monthly breakdown.")
+        # Store only the combined summary
+        all_products_combined["總金額_顯示"] = all_products_combined["總金額"].round(2).apply(lambda x: f"{x:,.2f}")
+        core_cols_no_monthly = ['排名', '產品代號', '產品名稱', '廠商簡稱', '庫存', '總數量', '總金額_顯示']
+        st.session_state.combined_top_products = all_products_combined[[col for col in core_cols_no_monthly if col in all_products_combined.columns]].rename(columns={"總金額_顯示": "總金額(元)"})
+        return
 
     # --- Pivot Monthly Summaries ---
     st.session_state.debug_info.append("  - Pivoting monthly summaries...")
+    st.session_state.debug_info.append(f"    - Pivot index: ['產品代號', '產品名稱']")
+    st.session_state.debug_info.append(f"    - Pivot columns: '年月'")
+    st.session_state.debug_info.append(f"    - Pivot values: ['月數量', '月金額']")
     try:
+        # Check for duplicates in index/columns before pivoting
+        pivot_check_cols = ['產品代號', '產品名稱', '年月']
+        if monthly_summary[pivot_check_cols].duplicated().any():
+            st.session_state.debug_info.append("    - Warning: Found duplicate combinations of Product ID, Name, and Month before pivoting. Aggregation will sum them.")
+            # Optional: Log the duplicates
+            # duplicates = monthly_summary[monthly_summary[pivot_check_cols].duplicated(keep=False)]
+            # st.session_state.debug_info.append(f"      - Duplicate sample:\n{duplicates.head().to_string()}")
+
         # Use aggfunc='sum' explicitly
         monthly_pivot = monthly_summary.pivot_table(
             index=['產品代號', '產品名稱'],
@@ -238,60 +319,69 @@ def calculate_all_top_products():
             aggfunc='sum', # Explicitly use sum
             fill_value=0
         )
+        st.session_state.debug_info.append(f"    - Pivot table shape: {monthly_pivot.shape}")
+        st.session_state.debug_info.append(f"    - Pivot table columns (MultiIndex): {monthly_pivot.columns.tolist()}")
         # Flatten MultiIndex columns
-        monthly_pivot.columns = [f"{col[1]}_{col[0]}" for col in monthly_pivot.columns]
+        monthly_pivot.columns = [f"{col[1]}_{col[0]}" for col in monthly_pivot.columns] # Example: 2025-01_月金額
         monthly_pivot = monthly_pivot.reset_index()
+        st.session_state.debug_info.append(f"    - Pivot table columns after flattening: {monthly_pivot.columns.tolist()}")
         st.session_state.debug_info.append("  - Successfully pivoted monthly data.")
     except Exception as e:
         st.session_state.debug_info.append(f"  - Error pivoting monthly data: {e}. Cannot add monthly breakdown.")
-        # Store only the combined top 100
-        top_100_combined["總金額_顯示"] = top_100_combined["總金額"].round(2).apply(lambda x: f"{x:,.2f}")
-        st.session_state.combined_top_products = top_100_combined[['排名', '產品代號', '產品名稱', '總數量', '總金額_顯示']].rename(columns={"總金額_顯示": "總金額(元)"})
+        import traceback
+        st.session_state.debug_info.append(f"    - Pivot error details: {traceback.format_exc()}")
+        # Store only the combined summary
+        all_products_combined["總金額_顯示"] = all_products_combined["總金額"].round(2).apply(lambda x: f"{x:,.2f}")
+        # Select and reorder columns including BC data before storing
+        core_cols_no_monthly = ['排名', '產品代號', '產品名稱', '廠商簡稱', '庫存', '總數量', '總金額_顯示'] # Added BC cols
+        st.session_state.combined_top_products = all_products_combined[[col for col in core_cols_no_monthly if col in all_products_combined.columns]].rename(columns={"總金額_顯示": "總金額(元)"})
         return
 
-    # --- Merge Monthly Data with Top 100 Combined ---
-    st.session_state.debug_info.append("  - Merging monthly data with Top 100...")
-    # Merge on the original top_100_combined which has numeric 總金額
-    final_top_100_table = pd.merge(
-        top_100_combined, # Use the one with numeric totals
+    # --- Merge Monthly Data with All Products Combined ---
+    st.session_state.debug_info.append("  - Merging monthly data with all products...")
+    # Merge on the all_products_combined which has numeric 總金額
+    final_all_products_table = pd.merge(
+        all_products_combined, # Use the one with numeric totals
         monthly_pivot,
         on=['產品代號', '產品名稱'],
         how='left'
     )
-    final_top_100_table = final_top_100_table.fillna(0) # Fill NaNs from merge
+    st.session_state.debug_info.append(f"    - Shape after merging pivot table: {final_all_products_table.shape}")
+    final_all_products_table = final_all_products_table.fillna(0) # Fill NaNs from merge
 
     # --- Format Columns AFTER calculations ---
     st.session_state.debug_info.append("  - Formatting final table columns...")
     # Format total amount (create a display column)
-    final_top_100_table["總金額_顯示"] = final_top_100_table["總金額"].round(2).apply(lambda x: f"{x:,.2f}")
+    final_all_products_table["總金額_顯示"] = final_all_products_table["總金額"].round(2).apply(lambda x: f"{x:,.2f}")
 
     # Format monthly amounts and quantities
-    amount_cols = [col for col in final_top_100_table.columns if col.endswith('_月金額')]
-    qty_cols = [col for col in final_top_100_table.columns if col.endswith('_月數量')]
+    amount_cols = [col for col in final_all_products_table.columns if col.endswith('_月金額')]
+    qty_cols = [col for col in final_all_products_table.columns if col.endswith('_月數量')]
 
     for col in amount_cols:
         month_year = col.split('_')[0]
         display_col_name = f"{month_year}_金額(元)"
         # Ensure column is numeric before formatting
-        if pd.api.types.is_numeric_dtype(final_top_100_table[col]):
-             final_top_100_table[display_col_name] = final_top_100_table[col].round(2).apply(lambda x: f"{x:,.2f}")
+        if pd.api.types.is_numeric_dtype(final_all_products_table[col]):
+             final_all_products_table[display_col_name] = final_all_products_table[col].round(2).apply(lambda x: f"{x:,.2f}")
         else:
-             final_top_100_table[display_col_name] = final_top_100_table[col] # Keep as is if not numeric
+             final_all_products_table[display_col_name] = final_all_products_table[col] # Keep as is if not numeric
              st.session_state.debug_info.append(f"    - Warning: Column {col} is not numeric, skipping currency formatting.")
 
     for col in qty_cols:
          month_year = col.split('_')[0]
          display_col_name = f"{month_year}_數量"
          # Ensure column is numeric before formatting
-         if pd.api.types.is_numeric_dtype(final_top_100_table[col]):
-              final_top_100_table[display_col_name] = final_top_100_table[col].astype(int)
+         if pd.api.types.is_numeric_dtype(final_all_products_table[col]):
+              final_all_products_table[display_col_name] = final_all_products_table[col].astype(int)
          else:
-              final_top_100_table[display_col_name] = final_top_100_table[col] # Keep as is
+              final_all_products_table[display_col_name] = final_all_products_table[col] # Keep as is
               st.session_state.debug_info.append(f"    - Warning: Column {col} is not numeric, skipping integer formatting.")
 
 
     # --- Select and Reorder columns for display ---
-    core_cols = ['排名', '產品代號', '產品名稱', '總數量', '總金額_顯示']
+    # Include BC columns in the core list and define the desired order
+    core_cols = ['排名', '產品代號', '產品名稱', '廠商簡稱', '庫存', '總數量', '總金額_顯示']
     unique_months_sorted = sorted(list(set([col.split('_')[0] for col in amount_cols + qty_cols])))
 
     monthly_cols_ordered = []
@@ -301,13 +391,13 @@ def calculate_all_top_products():
 
     final_column_order = core_cols + monthly_cols_ordered
     # Select only the columns needed for display
-    display_table = final_top_100_table[final_column_order].copy()
+    display_table = final_all_products_table[final_column_order].copy()
 
     # Rename the total amount display column
     display_table = display_table.rename(columns={"總金額_顯示": "總金額(元)"})
 
     st.session_state.combined_top_products = display_table
-    st.session_state.debug_info.append("Finished calculating and augmenting Top 100 products table.")
+    st.session_state.debug_info.append("Finished calculating and augmenting ALL products table with BC data.")
 
 
 def get_uploaded_files(directory):
@@ -598,18 +688,26 @@ def split_data_levels(df):
         else:
             st.session_state.debug_info.append("找不到訂單號欄位，無法識別訂單行")
             return None, None
-        
-        # Step 2: Create order level dataframe from identified order rows
-        order_df = df[row_types].copy()
-        
-        # Ensure all required order columns are present
-        order_cols = [col for col in ORDER_LEVEL_COLUMNS if col in df.columns]
-        order_df = order_df[order_cols]
-        
-        # Step 3: Create product level dataframe from product rows
-        product_df = df[~row_types].copy()
-        
-        # Ensure numeric columns are properly typed
+
+        # Step 2: Create order level dataframe
+        order_cols_present = [col for col in ORDER_LEVEL_COLUMNS if col in df.columns]
+        # Also include date columns derived earlier
+        date_cols_present = [col for col in ['年月', '年', '月'] if col in df.columns]
+        cols_to_select_order = list(set(order_cols_present + date_cols_present)) # Combine and ensure uniqueness
+        # Filter rows and select columns simultaneously using .loc
+        order_df = df.loc[row_types, [col for col in cols_to_select_order if col in df.columns]].copy()
+
+        # Step 3: Create product level dataframe
+        product_cols_present = [col for col in PRODUCT_LEVEL_COLUMNS if col in df.columns]
+        # Combine product columns and date columns
+        cols_to_select_product = list(set(product_cols_present + date_cols_present))
+        # Filter rows and select columns simultaneously using .loc
+        product_df = df.loc[~row_types, [col for col in cols_to_select_product if col in df.columns]].copy()
+
+        st.session_state.debug_info.append(f"Final order_df columns after split: {order_df.columns.tolist()}")
+        st.session_state.debug_info.append(f"Final product_df columns after split: {product_df.columns.tolist()}")
+
+        # Ensure numeric columns are properly typed in order_df
         for col in ['總計金額', '毛利', '成本總額']:
             if col in order_df.columns and not pd.api.types.is_numeric_dtype(order_df[col]):
                 order_df[col] = pd.to_numeric(order_df[col], errors='coerce')
@@ -629,7 +727,9 @@ def split_data_levels(df):
         
         st.session_state.debug_info.append(f"成功建立訂單層級數據，共 {len(order_df)} 筆訂單")
         
-        # Step 4: Assign each product to its parent order
+        # Step 4: Assign each product to its parent order (This section seems less relevant now, but keep for potential future use)
+        # The propagation logic might be redundant if preprocess_hierarchical_excel worked correctly.
+        # Consider simplifying or removing if confirmed redundant later.
         if not product_df.empty:
             # Create a mapping from order number to order row
             if '銷貨單號' in order_df.columns and '銷貨單號' in product_df.columns:
@@ -679,6 +779,10 @@ def split_data_levels(df):
                 order_num = row['銷貨單號'] if '銷貨單號' in row else 'Unknown'
                 amount = row['總計金額'] if '總計金額' in row else 0
                 st.session_state.debug_info.append(f"  訂單 {order_num}: {amount}")
+
+        # Update session state *after* final DFs are created and processed
+        st.session_state.processed_data['order_level'] = order_df
+        st.session_state.processed_data['product_level'] = product_df
         
         return order_df, product_df
         
@@ -1190,9 +1294,9 @@ def preprocess_hierarchical_excel(df):
             if order_col in processed_df.columns:
                 # For each group of rows with the same order_id_internal, fill the NaN values
                 # in order columns with the value from the order row
-                # Using ffill() instead of fillna(method='ffill') to avoid FutureWarning
+                # Using transform with ffill is more performant, accept FutureWarning for now.
                 processed_df[order_col] = processed_df.groupby('order_id_internal')[order_col].transform(
-                    lambda x: x.ffill()
+                   lambda x: x.ffill()
                 )
         
         # Drop the temporary column
@@ -1249,8 +1353,10 @@ def process_sales_data(df_list, filenames=None):
         cleaned_df = inspect_and_clean_data(combined_df)
         
         # Split into order and product level
+        order_df, product_df = None, None # Initialize
         if cleaned_df is not None:
-            order_df, product_df = split_data_levels(cleaned_df)
+            order_df, product_df = split_data_levels(cleaned_df) # This function updates session state internally now
+            # Explicitly update session state again for clarity (though split_data_levels should handle it)
             st.session_state.processed_data['order_level'] = order_df
             st.session_state.processed_data['product_level'] = product_df
             
@@ -1263,7 +1369,13 @@ def process_sales_data(df_list, filenames=None):
                 
                 st.session_state.debug_info.append(f"訂單層級統計: {len(order_df)} 筆訂單")
                 st.session_state.debug_info.append(f"訂單層級有效值: 總計金額 {totals_count}, 毛利 {profit_count}, 銷貨日期 {date_count}")
-        
+
+        # Generate monthly report using the split order_df if available
+        if order_df is not None:
+             generate_monthly_sales_report(order_df) # Pass the split order_df directly
+        else:
+             st.session_state.debug_info.append("無法生成月度報告，因為訂單層級數據處理失敗")
+             
         return cleaned_df
         
     except Exception as e:
@@ -1278,31 +1390,40 @@ def generate_monthly_sales_report(df):
     
     This function is designed to work with hierarchical data where order-level
     rows contain sales totals and dates. Only the order-level rows should be used
-    for generating the monthly summary to avoid double-counting.
+    Uses the DataFrame passed directly as input.
     """
-    # 非常重要：直接使用已處理的訂單層級數據，而不是傳入的 df
-    if st.session_state.processed_data['order_level'] is not None:
-        # 使用訂單層級數據
-        order_df = st.session_state.processed_data['order_level'].copy()
-        st.session_state.debug_info.append(f"直接使用訂單層級數據：{len(order_df)} 行，而非完整資料 {len(df)} 行")
-    else:
-        st.session_state.debug_info.append("無法找到訂單層級數據")
+    st.session_state.debug_info.append(f"Generating monthly report. Received DataFrame columns: {df.columns.tolist()}") # Add this debug line
+
+    if df is None or df.empty:
+        st.session_state.debug_info.append("無法生成月度報告: 提供的訂單數據為空")
+        st.session_state.processed_data['monthly_summary'] = None # Ensure reset
         return None
-    
+
+    # Use the passed DataFrame directly (no copy needed here)
+    order_df = df 
+
     # 檢查必要欄位
-    if not all(col in order_df.columns for col in ['年月', '總計金額', '毛利']):
-        st.session_state.debug_info.append("訂單層級數據缺少必要欄位")
+    required_cols = ['年月', '總計金額', '毛利']
+    missing_cols = [col for col in required_cols if col not in order_df.columns]
+    if missing_cols:
+        st.session_state.debug_info.append(f"訂單層級數據缺少必要欄位 for monthly report: {', '.join(missing_cols)}")
+        st.session_state.processed_data['monthly_summary'] = None # Ensure reset
         return None
-    
+
     # 記錄總金額作為參考
     total_amount = order_df['總計金額'].sum()
-    st.session_state.debug_info.append(f"訂單層級總計金額：{total_amount}")
+    st.session_state.debug_info.append(f"訂單層級總計金額 (for monthly report): {total_amount}")
     
     # 按月份分組
-    monthly_report = order_df.groupby('年月').agg({
-        '總計金額': 'sum',
-        '毛利': 'sum'
-    }).reset_index()
+    try:
+        monthly_report = order_df.groupby('年月').agg({
+            '總計金額': 'sum',
+            '毛利': 'sum'
+        }).reset_index()
+    except Exception as e:
+        st.session_state.debug_info.append(f"Error during groupby in generate_monthly_sales_report: {e}")
+        st.session_state.processed_data['monthly_summary'] = None # Ensure reset
+        return None
     
     # 計算毛利率
     monthly_report['毛利率'] = (monthly_report['毛利'] / monthly_report['總計金額']) * 100
@@ -1645,13 +1766,15 @@ with st.sidebar:
                     # Process combined data for overall report
                     if all_dfs:
                         st.session_state.sales_data = process_sales_data(all_dfs, all_filenames)
-                        if st.session_state.sales_data is not None:
-                             generate_monthly_sales_report(st.session_state.sales_data) # Uses processed_data['order_level']
-                             calculate_all_top_products() # Calculate top products after processing
-                        else:
-                             st.session_state.debug_info.append("合併數據處理失敗，無法生成月度報告")
-                             st.session_state.combined_top_products = None # Reset top products
-                             # st.session_state.monthly_top_products = {} # No longer needed
+                        # The correct call to generate_monthly_sales_report is inside process_sales_data
+                        # This call was redundant and used the wrong dataframe (combined instead of order_level)
+                        # if st.session_state.sales_data is not None:
+                        #      generate_monthly_sales_report(st.session_state.sales_data) # Incorrect call removed
+                        #      # calculate_all_top_products() # Moved: Calculate after BC data is potentially loaded
+                        # else:
+                        #      st.session_state.debug_info.append("合併數據處理失敗，無法生成月度報告")
+                        st.session_state.combined_top_products = None # Reset top products
+                        # st.session_state.monthly_top_products = {} # No longer needed
 
                     else:
                         st.session_state.debug_info.append("沒有成功讀取任何銷售檔案")
@@ -1736,13 +1859,15 @@ with st.sidebar:
                     # Process combined data for overall report
                     if all_dfs:
                         st.session_state.sales_data = process_sales_data(all_dfs, all_filenames)
-                        if st.session_state.sales_data is not None:
-                             generate_monthly_sales_report(st.session_state.sales_data) # Uses processed_data['order_level']
-                             calculate_all_top_products() # Calculate top products after processing
-                        else:
-                             st.session_state.debug_info.append("合併數據處理失敗，無法生成月度報告")
-                             st.session_state.combined_top_products = None # Reset top products
-                             # st.session_state.monthly_top_products = {} # No longer needed
+                        # The correct call to generate_monthly_sales_report is inside process_sales_data
+                        # This call was redundant and used the wrong dataframe (combined instead of order_level)
+                        # if st.session_state.sales_data is not None:
+                        #      generate_monthly_sales_report(st.session_state.sales_data) # Incorrect call removed
+                        #      # calculate_all_top_products() # Moved: Calculate after BC data is potentially loaded
+                        # else:
+                        #      st.session_state.debug_info.append("合併數據處理失敗，無法生成月度報告")
+                        st.session_state.combined_top_products = None # Reset top products
+                        # st.session_state.monthly_top_products = {} # No longer needed
                     else:
                         st.session_state.debug_info.append("沒有成功讀取任何銷售檔案")
                         st.session_state.sales_data = None
@@ -1814,9 +1939,12 @@ with st.sidebar:
                 try:
                     st.session_state.bc_data = pd.read_excel(bc_file)
                     st.session_state.debug_info.append(f"成功讀取 BC 檔案 {bc_file.name}，有 {len(st.session_state.bc_data)} 行")
+                    # Try calculating products table now that BC data is loaded
+                    if st.session_state.processed_data.get('product_level') is not None:
+                        calculate_all_top_products()
                 except Exception as e:
                     st.session_state.debug_info.append(f"讀取 BC 檔案時發生錯誤: {e}")
-            else: 
+            else:
                 st.error("儲存 BC 檔案失敗。")
             
             # Show preview
@@ -1846,9 +1974,12 @@ with st.sidebar:
                 try:
                     st.session_state.bc_data = pd.read_excel(file_path)
                     st.session_state.debug_info.append(f"成功讀取 BC 檔案 {selected_bc_file}，有 {len(st.session_state.bc_data)} 行")
+                    # Try calculating products table now that BC data is loaded
+                    if st.session_state.processed_data.get('product_level') is not None:
+                        calculate_all_top_products()
                 except Exception as e:
                     st.session_state.debug_info.append(f"讀取 BC 檔案時發生錯誤: {e}")
-                
+
                 with st.expander(f"預覽: {selected_bc_file}"):
                     try:
                         preview_bc_df = pd.read_excel(file_path)
@@ -1864,7 +1995,7 @@ with st.sidebar:
         st.session_state.debug_info = []  # Reset debug info
         st.session_state.debug_info.append("開始新的分析...")
         st.session_state.file_summaries = {} # Reset individual summaries
-        st.session_state.combined_top_products = None # Reset top products
+        # st.session_state.combined_top_products = None # Reset top products - Let recalculation handle this
         # st.session_state.monthly_top_products = {} # No longer needed
 
         # Re-process based on selected files (need to know which files are currently selected)
@@ -1875,13 +2006,8 @@ with st.sidebar:
         # A more robust way might involve flags or checking data readiness.
         # For now, let's try calling it directly before rerun.
 
-        # Attempt calculations based on current state before triggering rerun
-        # This assumes the data might already be in session state from previous interactions
-        if st.session_state.processed_data.get('product_level') is not None:
-             calculate_all_top_products()
-        else:
-             st.session_state.debug_info.append("分析按鈕: 產品數據尚未處理，無法計算熱門產品。")
-
+        # Calculations are now triggered within the file loading sections after data is ready.
+        # No need to call calculate_all_top_products() here explicitly.
 
         # This part is tricky as the button click doesn't re-run the file selection logic immediately.
         # A better approach might be to trigger a rerun or ensure data is reprocessed fully.
@@ -2286,19 +2412,21 @@ if 'file_summaries' in st.session_state and st.session_state.file_summaries:
                 # st.markdown("---")
             col_idx += 1
 
-# Top Products Section
-st.markdown("### 熱門產品銷售 (Top 100)")
+# All Products Section (Changed from Top Products)
+st.markdown("### 產品銷售列表 (全部)")
 
 combined_top_products_df = st.session_state.get('combined_top_products')
 
 if combined_top_products_df is not None and not combined_top_products_df.empty:
-    st.success(f"成功生成 Top {len(combined_top_products_df)} 產品列表 (含月度數據)")
+    st.success(f"成功生成 {len(combined_top_products_df)} 項產品列表 (含月度數據)") # Changed message
     with st.container(border=True):
         # Rename columns for display - dynamically handle monthly columns
         column_rename = {
             "排名": "排名",
             "產品代號": "產品代號",
             "產品名稱": "產品名稱",
+            "廠商簡稱": "廠商",  # Added mapping for supplier
+            "庫存": "庫存",      # Added mapping for inventory
             "總數量": "總數量",
             "總金額": "總金額(元)"
         }
@@ -2318,10 +2446,10 @@ if combined_top_products_df is not None and not combined_top_products_df.empty:
         st.dataframe(display_df, hide_index=True, height=600, use_container_width=True)
 
 elif st.session_state.processed_data.get('product_level') is not None and st.session_state.sales_files_uploaded:
-     st.warning("無法獲取熱門產品清單。請檢查產品數據和除錯資訊。")
+     st.warning("無法獲取產品銷售清單。請檢查產品數據和除錯資訊。") # Changed message
 else:
-    # Fallback message if no top product data is available at all
-    st.info("請先上傳並成功處理銷售數據，以查看熱門產品清單。")
+    # Fallback message if no product data is available at all
+    st.info("請先上傳並成功處理銷售數據，以查看產品銷售清單。") # Changed message
 
 
 # Monthly Comparison Section (only show when there are multiple months of data)
