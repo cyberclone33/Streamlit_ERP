@@ -1,1529 +1,2071 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import os
-import shutil
-from io import BytesIO
+import base64
 from datetime import datetime
-
-# Configure page and set up data directories
-st.set_page_config(page_title="FAFA ERP 智能銷售助理", layout="wide")
-
-# Initialize session state for section navigation if it doesn't exist
-if 'current_section' not in st.session_state:
-    st.session_state.current_section = "生成報表"
-
-# Initialize session state for report generation if it doesn't exist
-if 'report_generated' not in st.session_state:
-    st.session_state.report_generated = False
-if 'selected_months_display' not in st.session_state:
-    st.session_state.selected_months_display = []
-# Initialize dataframes in session state
-if 'sales_df' not in st.session_state: st.session_state.sales_df = pd.DataFrame()
-if 'summary_df' not in st.session_state: st.session_state.summary_df = pd.DataFrame()
-if 'order_summary' not in st.session_state: st.session_state.order_summary = pd.DataFrame()
-if 'bc_df' not in st.session_state: st.session_state.bc_df = pd.DataFrame()
-if 'merged_df' not in st.session_state: st.session_state.merged_df = pd.DataFrame()
-if 'customer_summary' not in st.session_state: st.session_state.customer_summary = pd.DataFrame() # Initialize customer summary
-if 'selected_vendor' not in st.session_state: st.session_state.selected_vendor = "請選擇..." # Initialize vendor selection
-if 'bc_load_error' not in st.session_state: st.session_state.bc_load_error = None # Initialize error state
-if 'merge_possible' not in st.session_state: st.session_state.merge_possible = False # Initialize merge state
-
-# No longer needed sections = ["生成報表", "訂單調閱", "產品分析", "BC 資料比對", "廠商產品查詢"]
-
-# Removed horizontal navigation bar
-
-st.title(f"📊 FAFA - ERP 智能銷售助理 - {st.session_state.current_section}")
-
-# Create data storage directories if they don't exist
-DATA_DIR = "uploaded_data"
-SALES_DIR = os.path.join(DATA_DIR, "sales_files")
-BC_DIR = os.path.join(DATA_DIR, "bc_files")
-
-os.makedirs(SALES_DIR, exist_ok=True)
-os.makedirs(BC_DIR, exist_ok=True)
-
-# =================== UTILITY FUNCTIONS ===================
-
-def save_uploaded_file(uploaded_file, directory):
-    """Save an uploaded file to the specified directory and return the file path
-    If a file with the same name already exists, it will be overwritten"""
-    filename = uploaded_file.name
-    # Use the original filename without timestamp to avoid duplicates
-    file_path = os.path.join(directory, filename)
-    
-    # Save the file, overwriting if it already exists
-    with open(file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    
-    return file_path
-
-def get_file_list(directory, file_type=None):
-    """Get list of files from the specified directory"""
-    if not os.path.exists(directory):
-        return []
-    
-    files = []
-    for filename in os.listdir(directory):
-        if file_type and not filename.endswith(file_type):
-            continue
-        file_path = os.path.join(directory, filename)
-        if os.path.isfile(file_path):
-            # Get file modification time for sorting
-            mod_time = os.path.getmtime(file_path)
-            # Store filename and path (original name is now the same as filename)
-            files.append({
-                "name": filename, 
-                "path": file_path, 
-                "full_name": filename,
-                "mod_time": mod_time,
-                "mod_time_str": datetime.fromtimestamp(mod_time).strftime("%Y/%m/%d %H:%M")
-            })
-    
-    # Sort by modification time (newest first)
-    files.sort(key=lambda x: x["mod_time"], reverse=True)
-    return files
-
-def delete_file(file_path):
-    """Delete a file from the filesystem"""
-    try:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            return True
-        return False
-    except Exception as e:
-        st.error(f"刪除檔案時發生錯誤: {e}")
-        return False
-
-def load_saved_excel_file(file_path):
-    """Load a saved Excel file from disk"""
-    return pd.read_excel(file_path)
-
-def clean_numeric_columns(df, columns):
-    for col in columns:
-        if col in df.columns: # Check if column exists before cleaning
-            df[col] = df[col].astype(str).str.replace(',', '', regex=False)
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).round(0).astype(int)
-    return df
-
-@st.cache_data # Cache loaded sales data based on file sources, selected months, and mapping
-def load_sales_data(_files, selected_months, is_path=False, column_mapping=None):
-    # Convert file objects to hashable representation (paths or names) for caching
-    # Note: Streamlit's caching might handle UploadedFile objects directly, but being explicit is safer.
-    # We use _files as the argument name to avoid modifying the original list inside the cached function.
-    files = []
-    if not is_path:
-        # Use file names and sizes as a proxy for identity if they are UploadedFile objects
-        files = [(f.name, f.size) for f in _files]
-    else:
-        # Use file paths if they are strings
-        files = tuple(_files) # Convert list to tuple to make it hashable
-
-    df_list = []
-    
-    for file_source in files:
-        # Handle both file objects and file paths
-        if is_path:
-            file_name = os.path.basename(file_source)
-            file_path = file_source
-        else: # UploadedFile object
-            file_name = file_source.name
-            file_path = file_source # Pass the object itself to pd.read_excel
-            
-        # Check if the filename contains any of the selected months
-        file_matches_month = False
-        for month in selected_months:
-            if month in file_name:
-                file_matches_month = True
-                break
-        
-        if file_matches_month:
-            try:
-                # pd.read_excel can handle both paths and file-like objects
-                df = pd.read_excel(file_path)
-                
-                # Apply column mapping if provided
-                if column_mapping and isinstance(column_mapping, dict):
-                    df = df.rename(columns=column_mapping)
-                
-                # Process the hierarchical structure before adding to list
-                order_columns = ['銷貨單號', '訂單單號', '銷貨日期', '客戶代號', '客戶名稱', 
-                                '部門代號', '部門名稱', '發票號碼', '未稅小計', '營業稅', 
-                                '折讓金額', '稅前折價', '總計金額', '實收總額', '成本總額', '毛利', '毛利率']
-                
-                # Add missing order columns with None
-                for col in order_columns:
-                    if col not in df.columns:
-                        df[col] = None
-                
-                # Forward fill the order information
-                df[order_columns] = df[order_columns].fillna(method='ffill')
-                
-                # Add order identification column
-                if '銷貨單號' in df.columns:
-                    df['order_id'] = df['銷貨單號'].astype(str)
-                
-                df_list.append(df)
-            except Exception as e:
-                st.error(f"無法讀取檔案 {file_name}: {e}")
-                
-    if df_list:
-        combined = pd.concat(df_list, ignore_index=True)
-        
-        # Process numeric columns (ensure they exist first)
-        numeric_cols = ['數量', '小計', '精準成本', '精準毛利']
-        combined = clean_numeric_columns(combined, numeric_cols)
-        
-        # Also ensure numeric processing for order-level columns
-        order_numeric_cols = ['未稅小計', '營業稅', '折讓金額', '稅前折價', 
-                             '總計金額', '實收總額', '成本總額', '毛利']
-        combined = clean_numeric_columns(combined, order_numeric_cols)
-        
-        return combined
-    return pd.DataFrame()
-
-@st.cache_data # Cache monthly summary generation
-def generate_monthly_summary(_df):
-    # Use _df to avoid modifying the original df inside the cached function
-    df = _df.copy()
-    if df.empty or '產品代號' not in df.columns:
-        return pd.DataFrame()
-        
-    agg_dict = {
-        '數量': 'sum',
-        '小計': 'sum',
-        '精準成本': 'sum',
-        '精準毛利': 'sum',
-        '產品名稱': 'first',
-        '倉別代號': 'first',
-        '倉別名稱': 'first'
-    }
-    # Only include columns that actually exist in the dataframe
-    valid_agg_dict = {k: v for k, v in agg_dict.items() if k in df.columns}
-
-    if not valid_agg_dict: # Need at least one column to aggregate
-        return pd.DataFrame()
-
-    grouped = df.groupby('產品代號').agg(valid_agg_dict).reset_index()
-    
-    # Ensure essential columns exist after aggregation, fill with 0 if not
-    for col in ['數量', '小計', '精準成本', '精準毛利']:
-        if col not in grouped.columns:
-            grouped[col] = 0
-
-    return grouped.sort_values(by='小計', ascending=False)
-
-@st.cache_data # Cache order summary generation
-def generate_order_summary(_df):
-    """Generate a summary table at the order level"""
-    # Use _df to avoid modifying the original df inside the cached function
-    df = _df.copy()
-    if df.empty:
-        return pd.DataFrame()
-        
-    required_cols = ['銷貨單號'] # Minimal requirement
-    if not all(col in df.columns for col in required_cols):
-        return pd.DataFrame()
-    
-    # Get unique order rows based on the first occurrence of each order number
-    order_df = df.drop_duplicates(subset=['銷貨單號']).copy()
-    
-    # Define potential order-level columns
-    order_cols = ['銷貨單號', '訂單單號', '銷貨日期', '客戶代號', '客戶名稱', 
-                '部門代號', '部門名稱', '發票號碼', '未稅小計', '營業稅', 
-                '折讓金額', '稅前折價', '總計金額', '實收總額', '成本總額', '毛利', '毛利率']
-    
-    # Filter to only include columns that actually exist in the order_df
-    existing_cols = [col for col in order_cols if col in order_df.columns]
-    
-    if not existing_cols:
-        return pd.DataFrame()
-    
-    # Start with just the existing order-level columns
-    order_summary = order_df[existing_cols].copy()
-    
-    # Add product count for each order
-    if '銷貨單號' in df.columns:
-        product_counts = df.groupby('銷貨單號').size().reset_index(name='產品數量')
-        order_summary = pd.merge(order_summary, product_counts, on='銷貨單號', how='left')
-    
-    # Calculate order total from product subtotals ONLY if an order total column doesn't exist
-    order_total_cols = ['總計金額', '實收總額', '未稅小計']
-    existing_total_col = next((col for col in order_total_cols if col in order_summary.columns), None)
-
-    if not existing_total_col and '小計' in df.columns and '銷貨單號' in df.columns:
-        product_totals = df.groupby('銷貨單號')['小計'].sum().reset_index(name='訂單產品總額')
-        order_summary = pd.merge(order_summary, product_totals, on='銷貨單號', how='left')
-    
-    # Sort by date (newest first) and then by order number if date exists
-    if '銷貨日期' in order_summary.columns:
-        order_summary = order_summary.sort_values(by=['銷貨日期', '銷貨單號'], ascending=[False, True])
-    
-    return order_summary
-
-@st.cache_data # Cache customer summary generation
-def generate_customer_summary(_order_summary_df):
-    """Generate a summary of top customers from the order summary"""
-    # Use _order_summary_df to avoid modifying the original df inside the cached function
-    order_summary_df = _order_summary_df.copy()
-    if order_summary_df.empty:
-        return pd.DataFrame()
-        
-    # Determine which amount column to use from the order summary
-    amount_col = None
-    for col in ['總計金額', '實收總額', '未稅小計', '訂單產品總額']: # Check order summary columns
-        if col in order_summary_df.columns:
-            amount_col = col
-            break
-    
-    if '客戶名稱' not in order_summary_df.columns or amount_col is None:
-        return pd.DataFrame()
-    
-    # Group by customer name and sum the total amount and count unique orders
-    customer_summary = order_summary_df.groupby('客戶名稱').agg(
-        消費總額=(amount_col, 'sum'),
-        訂單數量=('銷貨單號', 'nunique') # Count unique order numbers
-    ).reset_index()
-    
-    # Calculate average order value, handle division by zero
-    customer_summary['平均單筆金額'] = customer_summary.apply(
-        lambda row: row['消費總額'] / row['訂單數量'] if row['訂單數量'] > 0 else 0,
-        axis=1
-    )
-    
-    # Sort by total amount spent, descending
-    customer_summary = customer_summary.sort_values(by='消費總額', ascending=False)
-    
-    return customer_summary
-
-@st.cache_data # Cache dead stock identification
-def identify_dead_stock(_summary_df, _bc_df):
-    """Identifies products with inventory but no sales in the selected period."""
-    summary_df = _summary_df.copy()
-    bc_df = _bc_df.copy()
-
-    if bc_df.empty or '產品代號' not in bc_df.columns or '數量' not in bc_df.columns:
-        st.warning("BC data is missing required columns ('產品代號', '數量') for dead stock analysis.")
-        return pd.DataFrame()
-    if summary_df.empty or '產品代號' not in summary_df.columns:
-         # If summary is empty, all BC stock is potentially "dead" for the period, but let's be cautious
-         st.info("Sales summary is empty. Dead stock analysis might show all inventoried items.")
-         # Create a dummy summary to allow the merge logic to proceed, marking all as having 0 sales
-         summary_df = pd.DataFrame({'產品代號': [], '銷售數量': []}) # Use '銷售數量' as the merge function expects
-    elif '數量' in summary_df.columns:
-         # Rename sales quantity if it exists in the summary
-         summary_df.rename(columns={'數量': '銷售數量'}, inplace=True)
-    else:
-         # If '數量' column doesn't exist in summary, add it as 0
-         summary_df['銷售數量'] = 0
-
-
-    # Prepare BC data: select relevant columns and standardize product code
-    bc_subset = bc_df[['產品代號', '數量']].copy()
-    bc_subset.rename(columns={'數量': '庫存數量'}, inplace=True)
-    bc_subset['產品代號'] = bc_subset['產品代號'].astype(str).str.strip()
-    bc_subset['庫存數量'] = pd.to_numeric(bc_subset['庫存數量'], errors='coerce').fillna(0).astype(int)
-
-    # Prepare Sales data: select relevant columns and standardize product code
-    sales_subset = summary_df[['產品代號', '銷售數量']].copy()
-    sales_subset['產品代號'] = sales_subset['產品代號'].astype(str).str.strip()
-    sales_subset['銷售數量'] = pd.to_numeric(sales_subset['銷售數量'], errors='coerce').fillna(0).astype(int)
-
-
-    # Merge BC data with sales data (right merge to keep all BC items)
-    merged_for_dead_stock = pd.merge(sales_subset, bc_subset, on='產品代號', how='right')
-
-    # Identify dead stock: Inventory > 0 and Sales == 0 (or NaN if no match in sales)
-    dead_stock_df = merged_for_dead_stock[
-        (merged_for_dead_stock['庫存數量'] > 0) &
-        (merged_for_dead_stock['銷售數量'].fillna(0) == 0)
-    ].copy()
-
-    # Add product names from original BC data if available
-    if '產品名稱' in bc_df.columns:
-        bc_names = bc_df[['產品代號', '產品名稱']].copy()
-        bc_names['產品代號'] = bc_names['產品代號'].astype(str).str.strip()
-        dead_stock_df = pd.merge(dead_stock_df, bc_names.drop_duplicates(subset=['產品代號']), on='產品代號', how='left')
-
-    # Select and order final columns
-    final_cols_order = ['產品代號', '產品名稱', '庫存數量']
-    final_cols = [col for col in final_cols_order if col in dead_stock_df.columns]
-    dead_stock_df = dead_stock_df[final_cols]
-
-    return dead_stock_df.sort_values(by='庫存數量', ascending=False)
-
-@st.cache_data
-def perform_abc_analysis(_summary_df):
-    """Performs ABC analysis based on product sales value ('小計')."""
-    summary_df = _summary_df.copy()
-    if summary_df.empty or '小計' not in summary_df.columns or '產品代號' not in summary_df.columns:
-        st.warning("Cannot perform ABC analysis: Summary data is empty or missing '小計' or '產品代號'.")
-        return pd.DataFrame()
-
-    # Ensure '小計' is numeric
-    summary_df['小計'] = pd.to_numeric(summary_df['小計'], errors='coerce').fillna(0)
-
-    # Sort by sales value descending
-    df_sorted = summary_df.sort_values(by='小計', ascending=False)
-
-    # Calculate cumulative sales and percentage
-    df_sorted['累計銷售額'] = df_sorted['小計'].cumsum()
-    total_sales = df_sorted['小計'].sum()
-
-    if total_sales == 0:
-        st.info("Total sales are zero, cannot calculate ABC percentages.")
-        df_sorted['累計銷售佔比'] = 0.0
-        df_sorted['ABC分類'] = 'C' # Assign all to C if no sales
-    else:
-        df_sorted['累計銷售佔比'] = (df_sorted['累計銷售額'] / total_sales) * 100
-
-        # Assign ABC category
-        def assign_abc(percentage):
-            if percentage <= 70: # A items: top 70%
-                return 'A'
-            elif percentage <= 90: # B items: next 20% (70% to 90%)
-                return 'B'
-            else: # C items: remaining 10%
-                return 'C'
-        df_sorted['ABC分類'] = df_sorted['累計銷售佔比'].apply(assign_abc)
-
-    # Select and reorder columns for clarity
-    abc_cols = ['產品代號', '產品名稱', '小計', '累計銷售額', '累計銷售佔比', 'ABC分類']
-    # Add other relevant columns if they exist
-    optional_cols = ['數量', '精準毛利', '庫存數量', '廠商簡稱'] # Add more if needed
-    final_cols = abc_cols + [col for col in optional_cols if col in df_sorted.columns]
-    # Ensure all selected columns actually exist before returning
-    final_cols = [col for col in final_cols if col in df_sorted.columns]
-
-
-    return df_sorted[final_cols]
-
-
-# Function to merge sales data with BC data
-def merge_with_bc(sales_summary_df, bc_df):
-    """
-    Merges the sales summary DataFrame with the BC (inventory) DataFrame based on '產品代號'.
-
-    Args:
-        sales_summary_df (pd.DataFrame): DataFrame containing summarized sales data with '產品代號'.
-        bc_df (pd.DataFrame): DataFrame containing BC inventory data with '產品代號', '數量' (inventory), and '廠商簡稱'.
-
-    Returns:
-        pd.DataFrame: Merged DataFrame with sales data and corresponding BC inventory and vendor info.
-                      Returns an empty DataFrame if inputs are invalid or missing required columns.
-    """
-    # Input validation
-    if sales_summary_df.empty or '產品代號' not in sales_summary_df.columns:
-        st.warning("Sales summary data is empty or missing '產品代號'. Cannot merge.")
-        return pd.DataFrame()
-    if bc_df.empty or '產品代號' not in bc_df.columns:
-        st.warning("BC data is empty or missing '產品代號'. Cannot merge.")
-        # Return the sales summary without BC info if BC data is invalid
-        # Add a placeholder column to indicate missing BC data
-        sales_summary_df_copy = sales_summary_df.copy()
-        sales_summary_df_copy['庫存數量'] = 'N/A'
-        sales_summary_df_copy['廠商簡稱'] = 'N/A'
-        return sales_summary_df_copy
-
-    # --- Data Preparation ---
-    # Create copies to avoid modifying original dataframes
-    sales_summary_copy = sales_summary_df.copy()
-    bc_df_copy = bc_df.copy()
-
-    # Standardize '產品代號' (Product Code) to string and strip whitespace for reliable merging
-    sales_summary_copy['產品代號'] = sales_summary_copy['產品代號'].astype(str).str.strip()
-    bc_df_copy['產品代號'] = bc_df_copy['產品代號'].astype(str).str.strip()
-
-    # Rename sales quantity column for clarity *before* merge
-    if '數量' in sales_summary_copy.columns:
-        sales_summary_copy.rename(columns={'數量': '銷售數量'}, inplace=True)
-
-    # Select and rename relevant columns from BC data
-    bc_cols_to_merge = ['產品代號']
-    bc_rename_map = {}
-    if '數量' in bc_df_copy.columns:
-        bc_cols_to_merge.append('數量')
-        bc_rename_map['數量'] = '庫存數量' # Rename BC quantity to avoid conflict
-    if '廠商簡稱' in bc_df_copy.columns:
-        bc_cols_to_merge.append('廠商簡稱')
-        # No rename needed for '廠商簡稱' unless it conflicts
-
-    # Check if essential BC columns exist before subsetting
-    missing_bc_cols = [col for col in ['數量', '廠商簡稱'] if col not in bc_df_copy.columns]
-    if missing_bc_cols:
-        st.warning(f"BC data is missing columns: {', '.join(missing_bc_cols)}. Merge will proceed without them.")
-
-    # Create a subset of BC data with only the necessary columns (handle missing ones)
-    valid_bc_cols_to_merge = [col for col in bc_cols_to_merge if col in bc_df_copy.columns]
-    if '產品代號' not in valid_bc_cols_to_merge: # Should not happen due to initial check, but safety first
-         st.error("Critical error: '產品代號' somehow lost in BC data processing.")
-         return sales_summary_copy # Return sales data only
-
-    bc_subset = bc_df_copy[valid_bc_cols_to_merge].copy()
-
-    # Apply renaming to the subset
-    bc_subset.rename(columns=bc_rename_map, inplace=True)
-
-    # --- Merge Operation ---
-    # Perform left merge: keep all sales summary rows, add BC info where available
-    merged_df = pd.merge(sales_summary_copy, bc_subset, on='產品代號', how='left')
-
-    # --- Post-Merge Handling ---
-    # Fill NaN values resulting from the merge (products sold but not in BC file or missing BC columns)
-    if '庫存數量' in merged_df.columns:
-        # Convert to numeric first, coercing errors, then fillna, then int
-        merged_df['庫存數量'] = pd.to_numeric(merged_df['庫存數量'], errors='coerce').fillna(0).astype(int)
-    else:
-        # If '庫存數量' wasn't even in bc_subset, add it as 0
-        merged_df['庫存數量'] = 0
-        st.info("Note: '庫存數量' column was not found in BC data; added as 0.") # Re-applying indentation fix
-
-
-    if '廠商簡稱' in merged_df.columns:
-        merged_df['廠商簡稱'] = merged_df['廠商簡稱'].fillna('未知廠商') # Placeholder for missing vendor info
-    else:
-        # If '廠商簡稱' wasn't in bc_subset, add it
-        merged_df['廠商簡稱'] = '未知廠商'
-        st.info("Note: '廠商簡稱' column was not found in BC data; added as '未知廠商'.")
-
-    # Ensure '銷售數量' exists, filling with 0 if it wasn't in the original sales summary
-    if '銷售數量' not in merged_df.columns:
-        merged_df['銷售數量'] = 0
-
-    # --- Final Column Order (Optional but good practice) ---
-    # Define desired column order, including the potentially renamed/added columns
-    desired_cols_order = [
-        '產品代號', '產品名稱', # From sales summary
-        '銷售數量', '小計', '精準成本', '精準毛利', # From sales summary (renamed quantity)
-        '庫存數量', '廠商簡稱', # From BC data
-        # Add other columns from sales_summary_df if they exist and are desired
-        '倉別代號', '倉別名稱'
-    ]
-    # Filter to only include columns that actually exist in the merged_df
-    final_columns = [col for col in desired_cols_order if col in merged_df.columns]
-    # Add any remaining columns from merged_df not in the desired list
-    final_columns.extend([col for col in merged_df.columns if col not in final_columns])
-
-    return merged_df[final_columns] # Return with potentially reordered columns
-
-def vendor_summary_table(merged_df):
-    if merged_df.empty or '廠商簡稱' not in merged_df.columns or '小計' not in merged_df.columns:
-        return pd.DataFrame()
-        
-    summary = merged_df.groupby('廠商簡稱').agg(
-        廠商總小計=('小計', 'sum')
-    ).reset_index().sort_values(by='廠商總小計', ascending=False)
-    return summary
-
-def extract_months_from_filenames(files):
-    months = []
-    for f in files:
-        name = f.name
-        try:
-            import re
-            date_patterns = [r'(\d{6})', r'(\d{4}[-_][01]\d)', r'(\d{4}年[01]?\d月)']
-            found_date = False
-            for pattern in date_patterns:
-                matches = re.findall(pattern, name)
-                if matches:
-                    for match in matches:
-                        clean_match = re.sub(r'[-_年月]', '', match)
-                        if clean_match.startswith('20') and len(clean_match) >= 6:
-                            year_month = clean_match[:6]
-                            if year_month not in months: # Avoid duplicates
-                                months.append(year_month)
-                            found_date = True
-                            break # Found a match for this file with this pattern
-                if found_date: break # Found a match for this file
-            if not found_date:
-                digits = ''.join(c for c in name if c.isdigit())
-                if len(digits) >= 6 and digits.startswith('20'):
-                    year_month = digits[:6]
-                    if year_month not in months:
-                         months.append(year_month)
-        except:
-            continue
-    return sorted(list(set(months)), reverse=True)
-
-def check_required_columns(df, required_columns):
-    """Check if all required columns exist and suggest mappings."""
-    present_columns = []
-    missing_columns = []
-    suggestions = {}
-    df_columns_lower = {col.lower(): col for col in df.columns} # Store original casing
-    required_columns_lower = {col.lower() for col in required_columns}
-
-    for req_col_orig in required_columns:
-        req_col_lower = req_col_orig.lower()
-        if req_col_lower in df_columns_lower:
-            present_columns.append(df_columns_lower[req_col_lower]) # Use original casing
-        else:
-            missing_columns.append(req_col_orig)
-            # Suggest similar column names (case-insensitive comparison)
-            potential_matches = []
-            for df_col_lower, df_col_orig in df_columns_lower.items():
-                 # Simple substring check or more advanced fuzzy matching could be used
-                 if req_col_lower in df_col_lower or df_col_lower in req_col_lower:
-                     potential_matches.append(df_col_orig) # Suggest original casing
-            if potential_matches:
-                suggestions[req_col_orig] = potential_matches
-                
-    # Return original casing for present columns as well
-    present_columns_original_case = [col for col in required_columns if col.lower() in df_columns_lower]
-
-    return present_columns_original_case, missing_columns, suggestions
-
-# =================== MAIN PAGE ===================
-
-# Define required headers for later use
-required_headers = [
-    "銷貨單號", "訂單單號", "銷貨日期", "客戶代號", "客戶名稱", "部門代號", "部門名稱",
-    "發票號碼", "未稅小計", "營業稅", "折讓金額", "稅前折價", "總計金額", "實收總額",
-    "成本總額", "毛利", "毛利率", "產品代號", "產品名稱", "倉別代號", "倉別名稱",
-    "數量", "單位", "單價", "小計", "成本總值", "產品毛利", "產品毛利率",
-    "銷售單價1", "精準成本", "精準毛利", "單位管銷成本", "管銷成本合計"
+import plotly.express as px
+import plotly.graph_objects as go
+import numpy as np
+
+# --------------------------------------------------
+# 🔧 CONFIG & CONSTANTS ---------------------------
+# --------------------------------------------------
+st.set_page_config(page_title="數據圖表生成器", layout="wide")
+
+UPLOADED_SALES_DIR = "uploaded_data/sales_files"
+UPLOADED_BC_DIR = "uploaded_data/bc_files"
+os.makedirs(UPLOADED_SALES_DIR, exist_ok=True)
+os.makedirs(UPLOADED_BC_DIR, exist_ok=True)
+
+# Data structure definitions
+ORDER_LEVEL_COLUMNS = [
+    "銷貨單號", "訂單單號", "銷貨日期", "客戶代號", "客戶名稱", "部門代號", "部門名稱", 
+    "發票號碼", "未稅小計", "營業稅", "折讓金額", "稅前折價", "總計金額", "實收總額", 
+    "成本總額", "毛利", "毛利率"
 ]
 
-# Group headers by category for better organization
-header_categories = {
-    "訂單基本資訊": ["銷貨單號", "訂單單號", "銷貨日期"],
-    "客戶資訊": ["客戶代號", "客戶名稱", "部門代號", "部門名稱", "發票號碼"],
-    "訂單金額資訊": ["未稅小計", "營業稅", "折讓金額", "稅前折價", "總計金額", "實收總額", "成本總額", "毛利", "毛利率"],
-    "產品資訊": ["產品代號", "產品名稱", "倉別代號", "倉別名稱"],
-    "產品銷售細節": ["數量", "單位", "單價", "小計", "成本總值", "產品毛利", "產品毛利率", "銷售單價1", "精準成本", "精準毛利"],
-    "其他": ["單位管銷成本", "管銷成本合計"]
-}
+PRODUCT_LEVEL_COLUMNS = [
+    "產品代號", "產品名稱", "倉別代號", "倉別名稱", "數量", "單位", "單價", "小計", 
+    "成本總值", "產品毛利", "產品毛利率", "銷售單價1", "精準成本", "精準毛利", 
+    "單位管銷成本", "管銷成本合計", "*銷貨日期", "*客戶代號", "*客戶條件", 
+    "*部門代號", "*業務代號", "*業務條件"
+]
 
-# Create sample data for reference and download
-sample_data = {
-    "銷貨單號": ["S202407001", "S202407001", "S202407002", "S202407002"], "訂單單號": ["O202407001", "O202407001", "O202407002", "O202407002"],
-    "銷貨日期": ["2024/07/01", "2024/07/01", "2024/07/05", "2024/07/05"], "客戶代號": ["C001", "C001", "C002", "C002"],
-    "客戶名稱": ["寵物樂園", "寵物樂園", "毛孩之家", "毛孩之家"], "部門代號": ["D01", "D01", "D01", "D01"],
-    "部門名稱": ["銷售部", "銷售部", "銷售部", "銷售部"], "發票號碼": ["IV240701", "IV240701", "IV240705", "IV240705"],
-    "未稅小計": [3000, 3000, 2500, 2500], "營業稅": [150, 150, 125, 125], "總計金額": [3150, 3150, 2625, 2625],
-    "產品代號": ["P001", "P002", "P001", "P003"], "產品名稱": ["狗糧1kg", "貓糧1kg", "狗糧1kg", "貓玩具"],
-    "倉別代號": ["W01", "W01", "W01", "W02"], "倉別名稱": ["主倉", "主倉", "主倉", "配件倉"],
-    "數量": [10, 5, 8, 3], "單位": ["包", "包", "包", "個"], "單價": [200, 250, 200, 300],
-    "小計": [2000, 1250, 1600, 900], "精準成本": [1400, 900, 1120, 500], "精準毛利": [600, 350, 480, 400]
-}
-sample_df = pd.DataFrame(sample_data)
+BC_COLUMNS = [
+    "產品代號", "產品名稱", "數量", "倉庫", "單位", "成本單價", "成本總價", 
+    "安全存量", "廠商代號", "廠商簡稱", "最後出貨日", "最後進貨日", "銷售單價1", 
+    "銷售單價2", "銷售單價3", "銷售單價4", "最低售價", "數量為零自動下架", 
+    "持續上架", "停止上架", "大類名稱", "中類名稱", "小類名稱", "備註", 
+    "EAN13碼", "CO128碼", "建議售價", "毛利率"
+]
 
-# Divider
-st.markdown("---")
-
-# Add sidebar information
-st.sidebar.title("資料來源選擇")
-with st.sidebar.expander("❓ 檔案格式說明"):
-    st.write("""
-    ### 銷貨檔案要求
-    - 檔案類型: Excel (.xlsx)
-    - 銷貨檔案應包含客戶資訊、產品資訊、銷售數量及金額等欄位
-    - 檔案名稱建議包含年月，例如: `sales_202407.xlsx`
-    ### BC 檔案要求
-    - 檔案類型: Excel (.xlsx)
-    - 應包含產品代號、庫存數量等欄位
-    ### 常見問題
-    1. **缺少欄位**: 如果提示缺少欄位，請檢查您的檔案是否包含所有必要欄位
-    2. **欄位名稱不匹配**: 請確保欄位名稱與系統需求一致
-    3. **檔案未顯示**: 請確保檔案名稱中包含年月標記
-    """)
-
-data_source = st.sidebar.radio("選擇數據來源方式", ["上傳新檔案", "使用已上傳的檔案"])
-
-if data_source == "上傳新檔案":
-    with st.sidebar.expander("📊 數據格式範例"):
-        st.code("""
-銷貨單號    銷貨日期    客戶代號    客戶名稱    產品代號    產品名稱    數量    單價    小計
-S202301001  2023/01/05  C001       寵物樂園    P001       狗糧1kg    10     200     2000
-S202301001  2023/01/05  C001       寵物樂園    P002       貓糧1kg    5      250     1250
-S202301002  2023/01/10  C002       毛孩之家    P003       寵物玩具    8      150     1200
-        """)
-
-# Initialize file sources
-sales_files = None
-bc_file = None
-sales_data_source = []
-bc_data_source = None
-
-# File Upload / Selection UI
-if data_source == "上傳新檔案":
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("上傳銷貨檔案")
-        sales_files = st.file_uploader("上傳銷貨單毛利分析 Excel（可多選）", type=['xlsx'], accept_multiple_files=True, key="sales_uploader")
-        if sales_files:
-            temp_saved_sales = []
-            for file in sales_files:
-                file_path = save_uploaded_file(file, SALES_DIR)
-                temp_saved_sales.append({"name": file.name, "path": file_path})
-            # Only update session state if new files are uploaded
-            if temp_saved_sales:
-                 st.session_state.saved_sales_files = temp_saved_sales
-            sales_data_source = sales_files # Use the uploader objects directly for loading
-    with col2:
-        st.subheader("上傳 BC 資料")
-        bc_file = st.file_uploader("上傳 BC SKU 資料 Excel（單一）", type=['xlsx'], key="bc_uploader")
-        if bc_file:
-            file_path = save_uploaded_file(bc_file, BC_DIR)
-            st.session_state.saved_bc_file = {"name": bc_file.name, "path": file_path}
-            bc_data_source = st.session_state.saved_bc_file['path'] # Use path for loading
-else: # Use previously uploaded files
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("選擇已上傳的銷貨檔案")
-        available_sales_files = get_file_list(SALES_DIR, ".xlsx")
-        if not available_sales_files:
-            st.info("尚未上傳任何銷貨檔案")
-        else:
-            file_options = [f"{file['name']}" for file in available_sales_files]
-            selected_sales_files_names = st.multiselect("選擇銷貨檔案", file_options, key="sales_selector")
-            # Map selected file names to their paths for loading
-            sales_data_source = [f['path'] for f in available_sales_files if f['name'] in selected_sales_files_names]
-    with col2:
-        st.subheader("選擇已上傳的 BC 檔案")
-        available_bc_files = get_file_list(BC_DIR, ".xlsx")
-        if not available_bc_files:
-            st.info("尚未上傳任何 BC 檔案")
-        else:
-            file_options = [f"{file['name']}" for file in available_bc_files]
-            selected_bc_file_name = st.selectbox("選擇 BC 檔案", file_options, key="bc_selector")
-            # Map selected file name to its path for loading
-            bc_data_source = next((f['path'] for f in available_bc_files if f['name'] == selected_bc_file_name), None)
-
-# Month selection based on available files
-months = []
-files_for_month_extraction = []
-if data_source == "上傳新檔案" and sales_files:
-    files_for_month_extraction = sales_files
-elif data_source == "使用已上傳的檔案" and sales_data_source:
-    # Create mock file objects with names for extraction function
-    files_for_month_extraction = [type('obj', (object,), {'name': os.path.basename(path)}) for path in sales_data_source]
-
-if files_for_month_extraction:
-    months = extract_months_from_filenames(files_for_month_extraction)
-
-selected_months = []
-if months:
-    selected_months = st.multiselect("選擇月份（可複選）", months, key="month_selector")
-
-# Initialize session state for column mapping if it doesn't exist
-if 'column_mapping' not in st.session_state:
-    st.session_state.column_mapping = {}
-
-# Show preview of uploaded/selected files
-st.markdown("---")
-st.subheader("📋 上傳/選擇檔案預覽")
-
-preview_file_source = None
-if data_source == "上傳新檔案" and sales_files:
-    preview_file_source = sales_files[0] # Preview first uploaded file
-elif data_source == "使用已上傳的檔案" and sales_data_source:
-    preview_file_source = sales_data_source[0] # Preview first selected file path
-
-if preview_file_source:
-    try:
-        sample_df_preview = pd.read_excel(preview_file_source, nrows=5)
-        st.write("銷貨資料預覽 (前5筆):")
-        st.dataframe(sample_df_preview, use_container_width=True)
-        
-        present_headers, missing_headers, suggestions = check_required_columns(sample_df_preview, required_headers)
-        
-        if missing_headers:
-            st.warning(f"**注意:** 上傳/選擇的檔案缺少 {len(missing_headers)} 個必要欄位")
-            with st.expander("🔄 欄位對應設定 (處理欄位名稱不一致)", expanded=True):
-                st.write("您可以將檔案中的欄位對應到系統需要的欄位名稱:")
-                with st.form("column_mapping_form"):
-                    essential_cols = ['產品代號', '產品名稱', '數量', '單價', '小計', '精準成本', '精準毛利'] # Added cost/profit
-                    missing_essential = [col for col in essential_cols if col in missing_headers]
-                    mapping_dict = {}
-                    file_columns = list(sample_df_preview.columns)
-                    
-                    if missing_essential:
-                        st.write("**必要欄位對應:**")
-                        for col in missing_essential:
-                            suggested_options = suggestions.get(col, [])
-                            options = [""] + suggested_options + [c for c in file_columns if c not in suggested_options]
-                            # Use current mapping as default if available
-                            current_mapping = next((k for k, v in st.session_state.column_mapping.items() if v == col), None)
-                            default_index = options.index(current_mapping) if current_mapping in options else 0
-                            mapping_dict[col] = st.selectbox(f"請選擇對應 '{col}' 的欄位:", options, index=default_index)
-                    
-                    other_missing = [col for col in missing_headers if col not in missing_essential]
-                    if other_missing and len(other_missing) <= 10: # Show more optional mappings
-                        st.write("**其他欄位對應 (選填):**")
-                        for col in other_missing:
-                            suggested_options = suggestions.get(col, [])
-                            options = [""] + suggested_options + [c for c in file_columns if c not in suggested_options]
-                            current_mapping = next((k for k, v in st.session_state.column_mapping.items() if v == col), None)
-                            default_index = options.index(current_mapping) if current_mapping in options else 0
-                            mapping_dict[col] = st.selectbox(f"請選擇對應 '{col}' 的欄位:", options, index=default_index)
-                    
-                    submitted = st.form_submit_button("應用欄位對應")
-                    if submitted:
-                        final_mapping = {v: k for k, v in mapping_dict.items() if v} # Reversed: {file_col: required_col}
-                        st.session_state.column_mapping = final_mapping
-                        st.success(f"✅ 已設定 {len(final_mapping)} 個欄位對應")
-                        st.rerun() # Rerun to apply mapping immediately
-
-                if st.session_state.column_mapping:
-                    st.write("**目前的欄位對應:**")
-                    mapping_items = [{"原始欄位": orig, "對應至": mapped} for orig, mapped in st.session_state.column_mapping.items()]
-                    st.dataframe(pd.DataFrame(mapping_items), use_container_width=True)
-                    if st.button("清除所有對應"):
-                        st.session_state.column_mapping = {}
-                        st.rerun()
-            
-            missing_data = [{"缺少欄位": col, "建議對應": ", ".join(suggestions.get(col, ["無"])[:3])} for col in missing_headers]
-            missing_df = pd.DataFrame(missing_data)
-            st.dataframe(missing_df, use_container_width=True)
-            st.info("💡 提示: 若檔案中使用了不同的欄位名稱，請使用上方的欄位對應功能來解決")
-        else:
-            st.success("✅ 所有必要欄位都已存在")
-        st.write(f"檔案統計: {len(sample_df_preview.columns)} 個欄位")
-    except Exception as e:
-        st.error(f"無法讀取檔案預覽: {e}")
-else:
-    st.info("請上傳或選擇檔案以查看預覽")
-
-st.markdown("---")
-
-# =================== SECTION DISPLAY LOGIC ===================
-
-# Removed logic for sections: "廠商產品查詢", "產品分析", "BC 資料比對", "訂單調閱"
+# Column definitions with explanations
+COLUMN_DEFINITIONS = {
+    # Order level
+    "銷貨單號": "訂單的唯一識別碼",
+    "訂單單號": "客戶的訂單編號",
+    "銷貨日期": "商品銷售的日期",
+    "客戶代號": "客戶的編號代碼",
+    "客戶名稱": "客戶的全名",
+    "部門代號": "部門的編號代碼",
+    "部門名稱": "部門的全名",
+    "發票號碼": "發票的識別號碼",
+    "未稅小計": "未包含稅金的總金額",
+    "營業稅": "交易中的稅金金額",
+    "折讓金額": "折扣或退款的金額",
+    "稅前折價": "稅前的折扣金額",
+    "總計金額": "包含稅金的總金額",
+    "實收總額": "實際收到的總金額",
+    "成本總額": "所有產品的總成本",
+    "毛利": "總計金額減去成本總額的差值",
+    "毛利率": "毛利除以總計金額的百分比",
     
-if st.session_state.current_section == "生成報表":
-    # Button to trigger report generation
-    has_data_input = (data_source == "上傳新檔案" and sales_files) or \
-                     (data_source == "使用已上傳的檔案" and sales_data_source)
-                     
-    if st.button("▶️ 生成報表", key="generate_report_button") and has_data_input and selected_months:
-        with st.spinner("處理資料中..."):
-            try:
-                # --- Reset previous report state ---
-                st.session_state.report_generated = False
-                keys_to_clear = ['sales_df', 'summary_df', 'order_summary', 'bc_df', 'merged_df', 'selected_months_display', 'customer_summary']
-                for key in keys_to_clear:
-                    if key in st.session_state: del st.session_state[key]
-                # --- End Reset ---
+    # Product level
+    "產品代號": "產品的唯一識別碼",
+    "產品名稱": "產品的名稱",
+    "倉別代號": "倉庫的編號代碼",
+    "倉別名稱": "倉庫的名稱",
+    "數量": "銷售的產品數量",
+    "單位": "產品的計量單位",
+    "單價": "每單位產品的價格",
+    "小計": "單價乘以數量的金額",
+    "成本總值": "產品的總成本",
+    "產品毛利": "小計減去成本總值的差額",
+    "產品毛利率": "產品毛利除以小計的百分比",
+    "銷售單價1": "產品的銷售單價",
+    "精準成本": "計算後的精確成本",
+    "精準毛利": "計算後的精確毛利",
+    "單位管銷成本": "每單位產品的管理和銷售成本",
+    "管銷成本合計": "總管理和銷售成本",
+    "*銷貨日期": "產品層級的銷貨日期",
+    "*客戶代號": "產品層級的客戶代號",
+    "*客戶條件": "與客戶相關的特殊條件",
+    "*部門代號": "產品層級的部門代號",
+    "*業務代號": "負責銷售的業務代表編號",
+    "*業務條件": "與業務代表相關的特殊條件",
+    
+    # BC specific
+    "倉庫": "產品儲存的倉庫",
+    "成本單價": "每單位產品的成本",
+    "成本總價": "成本單價乘以數量的總金額",
+    "安全存量": "庫存應保持的最低數量",
+    "廠商代號": "供應商的編號代碼",
+    "廠商簡稱": "供應商的簡稱",
+    "最後出貨日": "最近一次出貨的日期",
+    "最後進貨日": "最近一次進貨的日期",
+    "銷售單價2": "第二種銷售單價",
+    "銷售單價3": "第三種銷售單價",
+    "銷售單價4": "第四種銷售單價",
+    "最低售價": "產品的最低銷售價格",
+    "數量為零自動下架": "庫存為零時是否自動下架",
+    "持續上架": "產品是否持續上架銷售",
+    "停止上架": "產品是否停止上架銷售",
+    "大類名稱": "產品的主要分類",
+    "中類名稱": "產品的次要分類",
+    "小類名稱": "產品的細分類別",
+    "備註": "關於產品的附加說明",
+    "EAN13碼": "產品的EAN13碼條碼",
+    "CO128碼": "產品的Code 128條碼",
+    "建議售價": "建議的零售價格",
+    "毛利率": "毛利除以銷售價格的百分比"
+}
 
-                column_mapping = st.session_state.get('column_mapping', {})
-                
-                # Determine if loading from path or object
-                load_is_path = (data_source == "使用已上傳的檔案")
-                
-                # Load sales data
-                sales_df_loaded = load_sales_data(sales_data_source, selected_months, is_path=load_is_path, column_mapping=column_mapping)
+# Initialize session state
+if 'sales_files_uploaded' not in st.session_state:
+    st.session_state.sales_files_uploaded = False
+if 'bc_file_uploaded' not in st.session_state:
+    st.session_state.bc_file_uploaded = False
+if 'sales_data' not in st.session_state:
+    st.session_state.sales_data = None
+if 'bc_data' not in st.session_state:
+    st.session_state.bc_data = None
+if 'debug_info' not in st.session_state:
+    st.session_state.debug_info = []
+if 'processed_data' not in st.session_state:
+    st.session_state.processed_data = {
+        'order_level': None,
+        'product_level': None,
+        'monthly_summary': None
+    }
 
-                if sales_df_loaded.empty:
-                    st.error("沒有找到符合選擇月份的資料，請檢查您的選擇。")
-                    st.session_state.report_generated = False
-                else:
-                    st.session_state.sales_df = sales_df_loaded
-                    st.session_state.summary_df = generate_monthly_summary(sales_df_loaded)
-                    st.session_state.order_summary = generate_order_summary(sales_df_loaded)
-                    # Generate customer summary from order summary
-                    st.session_state.customer_summary = generate_customer_summary(st.session_state.order_summary)
-                    
-                    # Perform ABC Analysis
-                    st.session_state.abc_analysis_df = perform_abc_analysis(st.session_state.summary_df)
-                    
-                    # Initialize dead stock dataframe
-                    st.session_state.dead_stock_df = pd.DataFrame() 
+# --------------------------------------------------
+# 🛠️ UTILITY FUNCTIONS ----------------------------
+# --------------------------------------------------
 
-                    # --- Process BC data ---
-                    bc_df_loaded = pd.DataFrame()
-                    merged_df_loaded = pd.DataFrame()
-                    bc_load_error = None
-                    merge_possible = False
+def get_uploaded_files(directory):
+    """Lists files in the specified directory."""
+    if not os.path.exists(directory):
+        return []
+    return [f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
 
-                    # Determine BC source path
-                    current_bc_source = None
-                    if data_source == "上傳新檔案" and bc_file:
-                        if 'saved_bc_file' in st.session_state and st.session_state.saved_bc_file:
-                            current_bc_source = st.session_state.saved_bc_file['path']
-                    elif data_source == "使用已上傳的檔案" and bc_data_source:
-                        current_bc_source = bc_data_source
+def save_uploaded_file(uploaded_file, directory):
+    """Saves an uploaded file to the specified directory."""
+    if uploaded_file is not None:
+        file_path = os.path.join(directory, uploaded_file.name)
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        return file_path
+    return None
 
-                    # Attempt to load BC data if source exists
-                    if current_bc_source:
-                        if os.path.exists(str(current_bc_source)):
-                            try:
-                                bc_df_loaded = pd.read_excel(current_bc_source)
-                                if bc_df_loaded.empty:
-                                    bc_load_error = "BC 檔案已載入但內容為空。"
-                                elif '產品代號' not in bc_df_loaded.columns:
-                                    bc_load_error = "BC 檔案缺少 '產品代號' 欄位。"
-                            except Exception as e:
-                                bc_load_error = f"讀取 BC 檔案時發生錯誤: {e}"
-                        else:
-                            bc_load_error = "選擇的 BC 檔案路徑不存在。"
-                    # No warning if BC file wasn't provided intentionally
-                    # elif (data_source == "上傳新檔案" and bc_file) or (data_source == "使用已上傳的檔案" and bc_data_source):
-                    #      bc_load_error = "選擇的 BC 檔案無法找到或讀取。"
-
-                    # --- Standardize Product Codes before checking validity ---
-                    summary_df_to_merge = st.session_state.summary_df.copy() # Work on a copy
-                    if not summary_df_to_merge.empty and '產品代號' in summary_df_to_merge.columns:
-                        summary_df_to_merge['產品代號'] = summary_df_to_merge['產品代號'].astype(str).str.strip()
-                    if not bc_df_loaded.empty and '產品代號' in bc_df_loaded.columns:
-                        # Ensure bc_df_loaded is updated after loading inside the try block
-                        pass # Standardization will happen after loading now
-
-                    # Check if merge is possible (re-check validity after standardization)
-                    summary_df_valid = not summary_df_to_merge.empty and '產品代號' in summary_df_to_merge.columns
-                    # bc_df_valid check needs to happen after loading
-                    
-                    # Attempt to load BC data if source exists
-                    if current_bc_source:
-                        if os.path.exists(str(current_bc_source)):
-                            try:
-                                bc_df_loaded = pd.read_excel(current_bc_source)
-                                if bc_df_loaded.empty:
-                                    bc_load_error = "BC 檔案已載入但內容為空。"
-                                elif '產品代號' not in bc_df_loaded.columns:
-                                    bc_load_error = "BC 檔案缺少 '產品代號' 欄位。"
-                                else:
-                                    # Standardize BC product code here
-                                    bc_df_loaded['產品代號'] = bc_df_loaded['產品代號'].astype(str).str.strip()
-                            except Exception as e:
-                                bc_load_error = f"讀取 BC 檔案時發生錯誤: {e}"
-                        else:
-                            bc_load_error = "選擇的 BC 檔案路徑不存在。"
-
-                    # Now check BC validity again after potential loading and standardization
-                    bc_df_valid = not bc_df_loaded.empty and '產品代號' in bc_df_loaded.columns
-
-                    if summary_df_valid and bc_df_valid:
-                        merge_possible = True
-                        try:
-                            # Pass the potentially standardized dataframes to the merge function
-                            merged_df_loaded = merge_with_bc(summary_df_to_merge, bc_df_loaded)
-                        except Exception as e:
-                             st.error(f"合併銷售與 BC 資料時發生錯誤: {e}")
-                             merged_df_loaded = pd.DataFrame() # Ensure it's empty on merge error
-                    elif bc_load_error:
-                         st.warning(f"無法進行 BC 資料合併，因為：{bc_load_error}")
-                    elif not summary_df_valid:
-                         st.warning("無法進行 BC 資料合併，因為銷售彙總資料無效或缺少 '產品代號'。")
-                    # If BC wasn't provided, no warning needed here, merge_possible remains False
-
-                    # --- Identify Dead Stock (after BC and Summary are processed) ---
-                    if bc_df_valid and summary_df_valid: # Only run if both inputs are valid
-                        try:
-                            st.session_state.dead_stock_df = identify_dead_stock(st.session_state.summary_df, bc_df_loaded)
-                        except Exception as e:
-                            st.error(f"計算滯銷庫存時發生錯誤: {e}")
-                            st.session_state.dead_stock_df = pd.DataFrame() # Ensure it's empty on error
-                    elif bc_df_valid: # BC is valid, but sales summary might be empty/invalid
-                         # Attempt identification, function handles empty summary
-                         try:
-                             st.session_state.dead_stock_df = identify_dead_stock(st.session_state.summary_df, bc_df_loaded)
-                         except Exception as e:
-                             st.error(f"計算滯銷庫存時發生錯誤 (無銷售資料): {e}")
-                             st.session_state.dead_stock_df = pd.DataFrame()
-                    # --- End Dead Stock Identification ---
-
-                    # Store results in session state
-                    st.session_state.bc_df = bc_df_loaded
-                    st.session_state.merged_df = merged_df_loaded
-                    st.session_state.report_generated = True
-                    st.session_state.bc_load_error = bc_load_error # Store potential load error
-                    st.session_state.merge_possible = merge_possible # Store if merge was attempted
-                    st.session_state.selected_months_display = selected_months
-                    st.rerun() # Rerun immediately to display the report section
-
-            except Exception as e:
-                st.error(f"生成報表時發生未預期的錯誤: {e}")
-                st.session_state.report_generated = False
-
-    # --- Report Display Section ---
-    if st.session_state.get('report_generated', False):
-        # Retrieve data from session state
-        sales_df = st.session_state.get('sales_df', pd.DataFrame())
-        summary_df = st.session_state.get('summary_df', pd.DataFrame())
-        order_summary = st.session_state.get('order_summary', pd.DataFrame())
-        bc_df = st.session_state.get('bc_df', pd.DataFrame())
-        merged_df = st.session_state.get('merged_df', pd.DataFrame())
-        customer_summary = st.session_state.get('customer_summary', pd.DataFrame())
-        selected_months_display = st.session_state.get('selected_months_display', [])
-
-        if not sales_df.empty:
-            order_tab, product_tab, bc_tab = st.tabs(["訂單摘要", "產品分析", "BC 資料比對"])
-
-            with product_tab:
-                st.subheader(f"🧾 {'、'.join(selected_months_display)} 產品銷售彙總表")
-                # Add ABC Analysis tab
-                product_tab1, product_tab2, product_tab3, product_tab4 = st.tabs(["前20大產品", "產品分析圖表", "完整產品列表", "ABC 分析"])
-                show_debug = st.checkbox("顯示計算驗證資訊", value=False, key="debug_checkbox_product", help="開啟此選項可以檢視數據計算過程和驗證資訊")
-                
-                with product_tab1:
-                    st.markdown("### 🏆 前20大銷售產品")
-                    if not summary_df.empty:
-                        top_products = summary_df.sort_values(by='小計', ascending=False).head(20).copy()
-                        display_df = top_products.copy()
-                        for col in ['小計', '精準成本', '精準毛利']:
-                            if col in display_df.columns:
-                                display_df[col] = display_df[col].apply(lambda x: f"${x:,.0f}")
-                        display_df.insert(0, '排名', range(1, len(display_df) + 1))
-                        display_cols = ['排名', '產品代號', '產品名稱', '數量', '小計', '精準成本', '精準毛利']
-                        st.dataframe(display_df[[col for col in display_cols if col in display_df.columns]], use_container_width=True)
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.markdown("#### 前20大產品銷售額")
-                            import altair as alt
-                            chart_data = pd.DataFrame({'產品': top_products['產品名稱'] + ' (' + top_products['產品代號'] + ')', '銷售額': top_products['小計']})
-                            chart = alt.Chart(chart_data).mark_bar().encode(y=alt.Y('產品:N', sort='-x', title=None), x=alt.X('銷售額:Q', title='銷售額'), color=alt.value('#4CAF50'), tooltip=['產品', '銷售額']).properties(height=400)
-                            text = chart.mark_text(align='left', baseline='middle', dx=5, color='black').encode(text=alt.Text('銷售額', format='$,.0f'))
-                            final_chart = (chart + text).configure_view(strokeWidth=0).configure_axis(labelFontSize=12, titleFontSize=14, grid=False)
-                            st.altair_chart(final_chart, use_container_width=True)
-                        with col2:
-                            st.markdown("#### 前20大產品銷售佔比")
-                            total_sales_all = summary_df['小計'].sum()
-                            if total_sales_all > 0:
-                                top_products['佔比'] = top_products['小計'] / total_sales_all * 100
-                                top_products['標籤'] = top_products.apply(lambda x: f"{x['產品名稱']} ({x['佔比']:.1f}%)", axis=1)
-                                if show_debug:
-                                    st.write(f"總銷售額: ${total_sales_all:,.0f}")
-                                    st.write(f"前20大產品銷售額: ${top_products['小計'].sum():,.0f} ({top_products['小計'].sum()/total_sales_all*100:.1f}%)")
-                                import plotly.express as px
-                                fig = px.pie(top_products, values='小計', names='標籤', title='前20大產品銷售佔比', color_discrete_sequence=px.colors.qualitative.Pastel)
-                                fig.update_traces(textposition='inside', textinfo='percent+label', hoverinfo='label+percent+value', textfont_size=10, marker=dict(line=dict(color='#FFFFFF', width=1)))
-                                fig.update_layout(showlegend=False, margin=dict(t=50, b=20, l=0, r=0))
-                                st.plotly_chart(fig, use_container_width=True)
-                                st.info("💡 圓餅圖顯示前20大產品的銷售額佔比。")
-                            else: st.info("總銷售額為零，無法計算佔比。")
-                    else: st.warning("無產品彙總資料可顯示。")
-
-                with product_tab2:
-                    st.markdown("### 📊 產品分析圖表")
-                    if not summary_df.empty:
-                        viz_type = st.selectbox("選擇圖表類型", ["產品銷量與銷售額比較", "產品毛利分析", "產品類別分析", "產品成本結構"], key="viz_type_selector")
-                        # ... [Visualization code using summary_df, ensure keys are used for widgets] ...
-                        # Example for Profit Analysis Scatter Plot
-                        if viz_type == "產品毛利分析":
-                             if '精準毛利' in summary_df.columns and '小計' in summary_df.columns:
-                                 profit_data = summary_df.copy()
-                                 profit_data['毛利率'] = profit_data.apply(lambda x: (x['精準毛利'] / x['小計'] * 100) if x['小計'] > 0 else 0, axis=1)
-                                 profit_data['精準毛利_abs'] = profit_data['精準毛利'].abs()
-                                 import plotly.express as px
-                                 fig = px.scatter(profit_data, x='小計', y='毛利率', size='精準毛利_abs', color='精準毛利', hover_name='產品名稱', text='產品代號', title='產品銷售額 vs 毛利率分析', labels={'小計': '銷售額', '毛利率': '毛利率 (%)', '精準毛利': '毛利額'}, color_continuous_scale=px.colors.sequential.Viridis)
-                                 fig.update_traces(textposition='top center', marker=dict(sizemin=5), selector=dict(mode='markers+text'))
-                                 fig.update_layout(xaxis=dict(title='銷售額', tickprefix='$'), yaxis=dict(title='毛利率 (%)'))
-                                 st.plotly_chart(fig, use_container_width=True)
-                                 # ... [rest of profit analysis code] ...
-                             else: st.warning("缺少 '精準毛利' 或 '小計' 欄位，無法進行毛利分析。")
-                        # ... [Implement other viz_type options similarly] ...
-                    else: st.warning("無產品彙總資料可供分析。")
-                    
-                with product_tab3:
-                    st.markdown("### 📋 完整產品列表")
-                    st.dataframe(summary_df, use_container_width=True)
-                    if not summary_df.empty:
-                        csv_summary = summary_df.to_csv(index=False).encode('utf-8-sig')
-                        st.download_button("💾 下載產品彙總 CSV", csv_summary, f"product_summary_{'_'.join(selected_months_display)}.csv", "text/csv", key="download_summary")
-                
-                with product_tab4:
-                    st.markdown("### 📈 ABC 分析 (依銷售額)")
-                    st.markdown("""
-                    **分類標準:**
-                    - **A類:** 累計銷售額佔比前 70% 的產品
-                    - **B類:** 累計銷售額佔比 70% - 90% 的產品
-                    - **C類:** 累計銷售額佔比後 10% 的產品
-                    """)
-                    abc_df = st.session_state.get('abc_analysis_df', pd.DataFrame())
-                    if not abc_df.empty:
-                        # Display summary counts
-                        abc_counts = abc_df['ABC分類'].value_counts().sort_index()
-                        st.metric("A類產品數量", abc_counts.get('A', 0))
-                        st.metric("B類產品數量", abc_counts.get('B', 0))
-                        st.metric("C類產品數量", abc_counts.get('C', 0))
-
-                        # Format percentage column
-                        display_abc_df = abc_df.copy()
-                        if '累計銷售佔比' in display_abc_df.columns:
-                             display_abc_df['累計銷售佔比'] = display_abc_df['累計銷售佔比'].map('{:.2f}%'.format)
-                        if '小計' in display_abc_df.columns:
-                             display_abc_df['小計'] = display_abc_df['小計'].apply(lambda x: f"${x:,.0f}")
-                        if '累計銷售額' in display_abc_df.columns:
-                             display_abc_df['累計銷售額'] = display_abc_df['累計銷售額'].apply(lambda x: f"${x:,.0f}")
-
-
-                        st.dataframe(display_abc_df, use_container_width=True)
-                        csv_abc = abc_df.to_csv(index=False).encode('utf-8-sig')
-                        st.download_button(
-                            "💾 下載 ABC 分析 CSV",
-                            csv_abc,
-                            f"abc_analysis_{'_'.join(selected_months_display)}.csv",
-                            "text/csv",
-                            key="download_abc"
-                        )
-                    else:
-                        st.warning("無法顯示 ABC 分析，請確認已生成報表且銷售資料包含 '小計' 欄位。")
-
-
-            with order_tab:
-                st.subheader(f"📋 {'、'.join(selected_months_display)} 訂單摘要表")
-                
-                # Add tabs within Order Summary
-                order_tab1, order_tab2, order_tab3, order_tab4 = st.tabs(["銷售表現摘要", "前10大客戶", "訂單詳細資料", "銷售趨勢"])
-
-                with order_tab1: # Sales Performance Summary
-                    if order_summary.empty:
-                        st.warning("無法生成訂單摘要，可能缺少必要的訂單資料欄位。")
-                    else:
-                        total_column = next((col for col in ['總計金額', '實收總額', '未稅小計', '訂單產品總額'] if col in order_summary.columns), None)
-                        st.markdown("### 📊 銷售表現摘要")
-                        total_orders = len(order_summary)
-                        total_amount = order_summary[total_column].sum() if total_column else 0
-                        avg_order = total_amount / total_orders if total_orders > 0 else 0
-                        
-                        # Create a stylish metrics section with custom styling
-                        metrics_container = st.container()
-                        with metrics_container:
-                            # Use CSS to style the metrics cards
-                            st.markdown("""
-                            <style>
-                            .metric-card {
-                                background-color: #f8f9fa;
-                                border-radius: 10px;
-                                padding: 20px;
-                                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-                                text-align: center;
-                                transition: transform 0.3s;
-                            }
-                            .metric-card:hover {
-                                transform: translateY(-5px);
-                            }
-                            .metric-value {
-                                font-size: 28px;
-                                font-weight: bold;
-                                color: #1E88E5;
-                                margin: 10px 0;
-                            }
-                            .metric-title {
-                                font-size: 16px;
-                                color: #455A64;
-                                margin-top: 5px;
-                            }
-                            </style>
-                            """, unsafe_allow_html=True)
-
-                            # Create three metric cards in columns
-                            col1, col2, col3 = st.columns(3)
-
-                            with col1:
-                                st.markdown(f"""
-                                <div class="metric-card">
-                                    <div class="metric-title">訂單總數</div>
-                                    <div class="metric-value">{total_orders:,}</div>
-                                    <div class="metric-title">筆</div>
-                                </div>
-                                """, unsafe_allow_html=True)
-
-                            with col2:
-                                st.markdown(f"""
-                                <div class="metric-card">
-                                    <div class="metric-title">總銷售額</div>
-                                    <div class="metric-value">${total_amount:,.0f}</div>
-                                    <div class="metric-title">新台幣</div>
-                                </div>
-                                """, unsafe_allow_html=True)
-
-                            with col3:
-                                st.markdown(f"""
-                                <div class="metric-card">
-                                    <div class="metric-title">平均訂單金額</div>
-                                    <div class="metric-value">${avg_order:,.0f}</div>
-                                    <div class="metric-title">新台幣/筆</div>
-                                </div>
-                                """, unsafe_allow_html=True)
-
-                        # Add spacing
-                        st.markdown("<br>", unsafe_allow_html=True)
-
-                with order_tab2: # Top 10 Customers
-                    if order_summary.empty:
-                         st.warning("無法生成客戶摘要，可能缺少必要的訂單資料欄位。")
-                    elif customer_summary.empty:
-                         st.warning("無法生成客戶摘要。")
-                    else:
-                        st.markdown("### 🏆 前10大客戶")
-                        top_customers = customer_summary.head(10)
-                        # Create two columns for visualization and table
-                        viz_col, table_col = st.columns([3, 2])
-
-                        with viz_col:
-                            # Create a bar chart for top customers
-                            data = {
-                                'customer': top_customers['客戶名稱'].tolist(),
-                                'amount': top_customers['消費總額'].tolist(),
-                                'orders': top_customers['訂單數量'].tolist()
-                            }
-
-                            # Use Streamlit native charts instead of matplotlib to avoid font issues
-                            import altair as alt
-
-                            # Prepare the data in the format Altair expects
-                            chart_data = pd.DataFrame({
-                                '客戶名稱': data['customer'],
-                                '消費總額': data['amount'],
-                                '訂單數量': data['orders']
-                            })
-
-                            # Create label with formatted amount and order count
-                            chart_data['label'] = chart_data.apply(
-                                lambda x: f"${x['消費總額']:,.0f} ({x['訂單數量']}筆)",
-                                axis=1
-                            )
-
-                            # Create an Altair chart
-                            chart = alt.Chart(chart_data).mark_bar().encode(
-                                y=alt.Y('客戶名稱:N', sort='-x', title=None),
-                                x=alt.X('消費總額:Q', title='銷售總額'),
-                                color=alt.value('#2196F3'),
-                                tooltip=['客戶名稱', '消費總額', '訂單數量', 'label']
-                            ).properties(
-                                title='前10大客戶銷售額',
-                                height=400
-                            )
-
-                            # Add text labels
-                            text = chart.mark_text(
-                                align='left',
-                                baseline='middle',
-                                dx=5,  # Offset the text slightly to the right of the bar
-                                color='black'
-                            ).encode(
-                                text='label'
-                            )
-
-                            # Combine chart and text
-                            final_chart = (chart + text).configure_view(
-                                strokeWidth=0
-                            ).configure_title(
-                                fontSize=16,
-                                font='Arial',
-                                anchor='start',
-                                fontWeight='bold'
-                            ).configure_axis(
-                                labelFontSize=12,
-                                titleFontSize=14,
-                                grid=False
-                            )
-
-                            # Display the chart
-                            st.altair_chart(final_chart, use_container_width=True)
-
-                        with table_col:
-                            # Format the table for display
-                            display_df = top_customers.copy()
-                            display_df['消費總額'] = display_df['消費總額'].apply(lambda x: f"${x:,.0f}")
-                            display_df['平均單筆金額'] = display_df['平均單筆金額'].apply(lambda x: f"${x:,.0f}")
-
-                            # Display the table
-                            st.dataframe(display_df, use_container_width=True)
-
-                        # Add spacing
-                        st.markdown("<br>", unsafe_allow_html=True)
-
-                with order_tab3: # Order Details
-                    if order_summary.empty:
-                         st.warning("無法顯示訂單詳細資料，可能缺少必要的訂單資料欄位。")
-                    else:
-                        st.markdown("### 📝 訂單詳細資料")
-                        st.dataframe(order_summary, use_container_width=True)
-                        csv_orders = order_summary.to_csv(index=False).encode('utf-8-sig')
-                        st.download_button("💾 下載訂單摘要 CSV", csv_orders, f"order_summary_{'_'.join(selected_months_display)}.csv", "text/csv", key="download_orders")
-
-                with order_tab4: # Sales Trend
-                    st.markdown("### 📈 銷售趨勢 (依月份)")
-                    if order_summary.empty or '銷貨日期' not in order_summary.columns:
-                        st.warning("無法生成銷售趨勢圖，缺少 '銷貨日期' 欄位。")
-                    else:
-                        # Ensure '銷貨日期' is datetime
-                        order_summary['銷貨日期'] = pd.to_datetime(order_summary['銷貨日期'], errors='coerce')
-                        # Drop rows where date conversion failed
-                        order_summary_trend = order_summary.dropna(subset=['銷貨日期']).copy()
-
-                        if not order_summary_trend.empty:
-                            # Determine the amount column to use
-                            amount_col_trend = next((col for col in ['總計金額', '實收總額', '未稅小計', '訂單產品總額'] if col in order_summary_trend.columns), None)
-
-                            if amount_col_trend:
-                                # Set date as index and resample by month
-                                order_summary_trend.set_index('銷貨日期', inplace=True)
-                                monthly_sales = order_summary_trend.resample('ME')[amount_col_trend].sum().reset_index() # 'ME' for Month End
-                                monthly_sales['銷貨月份'] = monthly_sales['銷貨日期'].dt.strftime('%Y-%m') # Format for display
-
-                                if not monthly_sales.empty:
-                                    import altair as alt
-                                    chart = alt.Chart(monthly_sales).mark_line(point=True).encode(
-                                        x=alt.X('銷貨月份:T', title='月份'),
-                                        y=alt.Y(f'{amount_col_trend}:Q', title='月銷售額'),
-                                        tooltip=['銷貨月份:T', alt.Tooltip(f'{amount_col_trend}:Q', format='$,.0f', title='銷售額')]
-                                    ).properties(
-                                        title='月銷售額趨勢'
-                                    )
-                                    st.altair_chart(chart, use_container_width=True)
-                                else:
-                                    st.info("選定期間內無足夠資料繪製趨勢圖。")
-                            else:
-                                st.warning("訂單摘要中找不到可用的金額欄位 ('總計金額', '實收總額', '未稅小計', '訂單產品總額') 來繪製趨勢圖。")
-                        else:
-                             st.warning("無法轉換 '銷貨日期' 為有效日期格式，無法繪製趨勢圖。")
-
-            with bc_tab:
-                st.subheader("🔄 BC 資料比對")
-                bc_load_error_display = st.session_state.get('bc_load_error', None)
-                merge_possible_display = st.session_state.get('merge_possible', False)
-
-                if bc_load_error_display:
-                    st.warning(f"BC 資料處理問題: {bc_load_error_display}")
-                    st.info("無法顯示 BC 相關報表。")
-                elif bc_df.empty and not merge_possible_display:
-                     # This case means BC file was likely not provided or selected
-                     st.info("未提供 BC 資料，無法進行比對分析。")
-                elif not merge_possible_display and not bc_df.empty:
-                     # BC data loaded, but summary was invalid
-                     st.warning("銷售彙總資料無效，無法進行 BC 比對。")
-                elif merge_possible_display and merged_df.empty:
-                    # Merge was possible and attempted, but result is empty (no matches)
-                    st.warning("銷售資料中的產品代號與 BC 資料中無匹配項目。請檢查兩份檔案中的產品代號是否一致（包括格式與空格）。") # Refined message
-                    # Optionally display the raw BC data here if needed
-                    # st.subheader("已載入的 BC 資料 (無匹配銷售項目)")
-                    # st.dataframe(bc_df, use_container_width=True)
-                elif not merged_df.empty: # Corrected indentation for this block
-                        # Merge successful and has data
-                        # Add Dead Stock tab
-                        bc_tab1, bc_tab2, bc_tab3, bc_tab4, bc_tab5 = st.tabs(["交叉比對結果", "廠商銷售彙總", "熱銷品精準毛利高到低", "廠商產品查詢", "滯銷庫存"])
-                        with bc_tab1:
-                            st.subheader("與 BC 資料交叉比對結果") # This header might be redundant now
-                            st.dataframe(merged_df, use_container_width=True)
-                            csv_merged = merged_df.to_csv(index=False).encode('utf-8-sig')
-                            st.download_button("下載交叉比對 CSV", csv_merged, f"merged_bc_sales_{'_'.join(selected_months_display)}.csv", "text/csv", key="download_merged")
-                        with bc_tab2:
-                            st.subheader("廠商銷售彙總")
-                            vendor_df = vendor_summary_table(merged_df)
-                            st.dataframe(vendor_df, use_container_width=True)
-                            csv_vendor = vendor_df.to_csv(index=False).encode('utf-8-sig')
-                            st.download_button("下載廠商彙總 CSV", csv_vendor, f"vendor_summary_{'_'.join(selected_months_display)}.csv", "text/csv", key="download_vendor")
-                        with bc_tab3:
-                            st.subheader("熱銷品精準毛利高到低")
-                            if not summary_df.empty and '精準毛利' in summary_df.columns:
-                                 profit_sorted_df = summary_df.sort_values(by='精準毛利', ascending=False).copy()
-                                 if not bc_df.empty and '數量' in bc_df.columns and '產品代號' in bc_df.columns:
-                                     inventory_dict = dict(zip(bc_df['產品代號'], bc_df['數量']))
-                                     profit_sorted_df['庫存'] = profit_sorted_df['產品代號'].map(inventory_dict)
-                                     profit_sorted_df['庫存'] = profit_sorted_df['庫存'].astype(str).str.replace(',', '', regex=False)
-                                     profit_sorted_df['庫存'] = pd.to_numeric(profit_sorted_df['庫存'], errors='coerce').fillna(0).astype(int)
-                                     if '數量' in profit_sorted_df.columns: # Check if sales quantity exists
-                                         profit_sorted_df['銷售/天'] = profit_sorted_df['數量'] / 30
-                                         profit_sorted_df['庫存天數'] = profit_sorted_df.apply(lambda x: round(x['庫存'] / x['銷售/天']) if x['銷售/天'] > 0 else 0, axis=1)
-                                         def inventory_status(days):
-                                             if days <= 0: return "缺貨"
-                                             elif days < 30: return "低"
-                                             elif days < 90: return "適中"
-                                             else: return "過多"
-                                         profit_sorted_df['庫存狀態'] = profit_sorted_df['庫存天數'].apply(inventory_status)
-                                     else: profit_sorted_df['庫存狀態'] = "未知 (無銷售數量)"
-                                 else: profit_sorted_df['庫存狀態'] = "未知 (無BC庫存)"
-                                 # ... [Display table and download button for profit_sorted_df] ...
-                                 st.dataframe(profit_sorted_df, use_container_width=True) # Simplified display for brevity
-                                 csv_profit_sorted = profit_sorted_df.to_csv(index=False).encode('utf-8-sig')
-                                 st.download_button("下載精準毛利排序 CSV", csv_profit_sorted, f"profit_sorted_products_{'_'.join(selected_months_display)}.csv", "text/csv", key="download_profit_sorted")
-                            else: st.warning("缺少資料無法生成此報表。")
-                        with bc_tab4:
-                            st.subheader("廠商產品查詢 (於本次報表範圍內)")
-                            # Check if BC data and vendor column are available
-                            if not bc_df.empty and '廠商簡稱' in bc_df.columns:
-                                # Check if merged data is available for vendor filtering
-                                if not merged_df.empty and '廠商簡稱' in merged_df.columns:
-                                    # Get unique vendors from the *merged* data relevant to the report
-                                    report_vendors = sorted(merged_df['廠商簡稱'].dropna().unique().tolist())
-                                    # Optionally remove the placeholder vendor
-                                    if '未知廠商' in report_vendors:
-                                        report_vendors.remove('未知廠商')
-
-                                    # Proceed if there are actual vendors in the report data
-                                    if report_vendors:
-                                        selected_vendor_report = st.selectbox(
-                                            "選擇廠商查看其本次銷售產品:",
-                                            ["請選擇..."] + report_vendors,
-                                            key="vendor_selector_report_tab" # Ensure unique key
-                                        )
-                                        # Display details if a vendor is selected
-                                        if selected_vendor_report != "請選擇...":
-                                            # Filter merged data for the selected vendor
-                                            vendor_merged_products = merged_df[merged_df['廠商簡稱'] == selected_vendor_report].copy()
-                                            st.write(f"**{selected_vendor_report}** 在本次報表範圍內銷售了 **{len(vendor_merged_products)}** 項產品:")
-
-                                            # Define and display relevant columns from the merged data
-                                            display_cols_vendor = ['產品代號', '產品名稱', '銷售數量', '小計', '精準毛利', '庫存數量']
-                                            # Ensure columns exist before trying to display them
-                                            final_display_cols = [col for col in display_cols_vendor if col in vendor_merged_products.columns]
-                                            st.dataframe(
-                                                vendor_merged_products[final_display_cols].sort_values(by='小計', ascending=False),
-                                                use_container_width=True
-                                            )
-
-                                            # Add an option to view all products from this vendor (using original BC data)
-                                            if st.checkbox(f"顯示 {selected_vendor_report} 的所有 BC 產品資料", key="show_all_vendor_bc_report"):
-                                                # Filter original BC data for the selected vendor
-                                                vendor_all_bc_products = bc_df[bc_df['廠商簡稱'] == selected_vendor_report].copy()
-                                                st.write(f"**{selected_vendor_report}** 在 BC 資料中共有 **{len(vendor_all_bc_products)}** 項產品:")
-                                                # Define and display basic columns from BC data
-                                                basic_columns_all = ['產品代號', '產品名稱', '單位', '數量'] # Note: '數量' here is BC inventory
-                                                display_columns_all = [col for col in basic_columns_all if col in vendor_all_bc_products.columns]
-                                                st.dataframe(
-                                                    vendor_all_bc_products[display_columns_all].sort_values('產品代號'),
-                                                    use_container_width=True
-                                                )
-                                                # Provide download for all BC products of the vendor
-                                                csv_vendor_all_bc = vendor_all_bc_products.to_csv(index=False).encode('utf-8-sig')
-                                                st.download_button(
-                                                    label=f"下載 {selected_vendor_report} 所有 BC 產品資料", # Corrected parameter name
-                                                    data=csv_vendor_all_bc, # Corrected parameter name
-                                                    file_name=f"{selected_vendor_report}_all_bc_products.csv", # Corrected parameter name
-                                                    mime="text/csv", # Corrected parameter name
-                                                    key="download_vendor_all_bc_report" # Ensure unique key
-                                                )
-                                    # Handle case where no vendors were found in the merged data
-                                    else:
-                                        st.info("本次報表範圍內沒有特定廠商的銷售資料可供查詢。")
-                                # Handle case where merged data is missing vendor info
-                                else:
-                                    st.warning("合併後的資料缺少廠商資訊，無法進行查詢。")
-                            # Handle case where BC data is missing vendor info or not loaded
-                            else:
-                                st.warning("BC檔案中缺少'廠商簡稱'欄位或未載入BC資料，無法進行廠商產品查詢。")
-                        with bc_tab5:
-                             st.subheader("📦 滯銷庫存 (有庫存但期間無銷售)")
-                             dead_stock_df = st.session_state.get('dead_stock_df', pd.DataFrame())
-                             if not dead_stock_df.empty:
-                                 st.write(f"找到 {len(dead_stock_df)} 項滯銷產品 (庫存 > 0 且本期銷售 = 0)")
-                                 st.dataframe(dead_stock_df, use_container_width=True)
-                                 csv_dead_stock = dead_stock_df.to_csv(index=False).encode('utf-8-sig')
-                                 st.download_button(
-                                     "💾 下載滯銷庫存 CSV",
-                                     csv_dead_stock,
-                                     f"dead_stock_{'_'.join(selected_months_display)}.csv",
-                                     "text/csv",
-                                     key="download_dead_stock"
-                                 )
-                             elif bc_df.empty or '數量' not in bc_df.columns:
-                                 st.info("無法計算滯銷庫存，因為 BC 資料未載入或缺少 '數量' 欄位。")
-                             else:
-                                 st.success("✅ 在此期間內，所有有庫存的產品都有銷售紀錄。")
-
+def load_excel(file_source, is_path=False):
+    """Generic Excel loader."""
+    try:
+        if is_path:
+            return pd.read_excel(file_source)
         else:
-            # This warning is for the main report generation failure
-            st.warning("報表生成失敗或未選擇有效月份的資料。")
+            return pd.read_excel(file_source)
+    except Exception as e:
+        display_name = "[Unknown Source]"
+        if isinstance(file_source, str):
+            display_name = os.path.basename(file_source)
+        elif hasattr(file_source, 'name'):
+            display_name = file_source.name
+        st.session_state.debug_info.append(f"讀取檔案 '{display_name}' 時發生錯誤: {e}")
+        return pd.DataFrame()
 
-    # Display message if no report is generated yet and not in another section
-    elif st.session_state.current_section == "生成報表":
-         st.info("請先選擇數據來源，選擇月份後按下『生成報表』")
+def debug_file_headers(df, file_type):
+    """Debug file headers and check if the required columns exist."""
+    if df is None or df.empty:
+        return f"⚠️ {file_type}檔案為空或無法讀取"
+    
+    # Define required columns based on file type
+    required_cols = []
+    if file_type == "銷售":
+        # Check for order level columns as minimum requirement
+        required_cols = ORDER_LEVEL_COLUMNS
+    elif file_type == "BC":
+        # Check for basic BC columns
+        required_cols = ["產品代號", "產品名稱", "數量", "倉庫", "單位", "成本單價", "成本總價"]
+    
+    # Check columns
+    columns = df.columns.tolist()
+    st.session_state.debug_info.append(f"{file_type}檔案欄位: {', '.join(columns[:10])}...")
+    
+    missing_cols = [col for col in required_cols if col not in columns]
+    
+    if missing_cols:
+        return f"⚠️ {file_type}檔案缺少必要欄位: {', '.join(missing_cols)}"
+    else:
+        # If this is a sales file, also debug the hierarchical structure
+        if file_type == "銷售":
+            debug_hierarchical_structure(df)
+        return f"✅ {file_type}檔案欄位正確"
 
-# --- File Management and Field Overview Sections ---
-st.markdown("---")
-st.subheader("系統設定與管理")
-file_mgmt_col, fields_overview_col = st.columns(2)
-
-with file_mgmt_col:
-    st.markdown("### 📁 檔案管理")
-    if 'file_to_delete' not in st.session_state: st.session_state.file_to_delete = None
-    if 'delete_type' not in st.session_state: st.session_state.delete_type = None
-    file_mgmt_tab1, file_mgmt_tab2 = st.tabs(["銷貨檔案", "BC 檔案"])
-    with file_mgmt_tab1:
-        sales_files_list = get_file_list(SALES_DIR, ".xlsx")
-        if st.button("🔄 重新整理銷貨檔案列表", key="refresh_sales"): st.rerun()
-        if not sales_files_list: st.info("尚未上傳任何銷貨檔案")
-        else:
-            st.write(f"已上傳的銷貨檔案 ({len(sales_files_list)})")
-            for i, file in enumerate(sales_files_list):
-                cols = st.columns([6, 3, 1])
-                cols[0].text(f"{i+1}. {file['name']}")
-                cols[1].text(f"修改: {file['mod_time_str']}")
-                if cols[2].button("🗑️", key=f"delete_sales_{i}", help="刪除此檔案"):
-                    st.session_state.file_to_delete = file['path']
-                    st.session_state.delete_type = "sales"
-                    st.rerun()
-            if st.button("🗑️ 刪除所有銷貨檔案", type="secondary", key="delete_all_sales"):
-                st.session_state.file_to_delete = "ALL_SALES"
-                st.session_state.delete_type = "all_sales"
-                st.rerun()
-    with file_mgmt_tab2:
-        bc_files_list = get_file_list(BC_DIR, ".xlsx")
-        if st.button("🔄 重新整理BC檔案列表", key="refresh_bc"): st.rerun()
-        if not bc_files_list: st.info("尚未上傳任何 BC 檔案")
-        else:
-            st.write(f"已上傳的 BC 檔案 ({len(bc_files_list)})")
-            for i, file in enumerate(bc_files_list):
-                cols = st.columns([6, 3, 1])
-                cols[0].text(f"{i+1}. {file['name']}")
-                cols[1].text(f"修改: {file['mod_time_str']}")
-                if cols[2].button("🗑️", key=f"delete_bc_{i}", help="刪除此檔案"):
-                    st.session_state.file_to_delete = file['path']
-                    st.session_state.delete_type = "bc"
-                    st.rerun()
-            if st.button("🗑️ 刪除所有BC檔案", type="secondary", key="delete_all_bc"):
-                st.session_state.file_to_delete = "ALL_BC"
-                st.session_state.delete_type = "all_bc"
-                st.rerun()
-
-with fields_overview_col:
-    with st.expander("📝 必要欄位一覽", expanded=False):
-        st.markdown("上傳檔案需包含下列欄位，否則可能導致分析失敗：")
-        header_tabs = st.tabs(list(header_categories.keys()))
-        for i, (category, headers) in enumerate(header_categories.items()):
-            with header_tabs[i]:
-                category_headers = [h for h in headers if h in required_headers]
-                if category_headers:
-                    headers_df = pd.DataFrame({"欄位名稱": category_headers})
-                    st.dataframe(headers_df, use_container_width=True)
-                else: st.info(f"此類別中沒有必要的欄位")
-        st.markdown("### 範例檔案")
-        col1, col2 = st.columns(2)
-        with col1:
-            csv_sample = sample_df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("⬇️ 下載範例檔案CSV", csv_sample, "sales_sample.csv", "text/csv", key="download_csv_sample")
-        with col2:
-            excel_sample = BytesIO()
-            sample_df.to_excel(excel_sample, index=False, engine='openpyxl')
-            excel_sample.seek(0)
-            st.download_button("⬇️ 下載範例檔案Excel", excel_sample, "sales_sample.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="download_excel_sample")
-        st.info("""💡 **提示:** 關鍵欄位如「產品代號」、「數量」、「小計」等必須有值。""")
-
-# Handle file deletion confirmation
-if st.session_state.file_to_delete:
-    with st.form(key="delete_confirmation_form"): # Added form key
-        file_name_display = os.path.basename(st.session_state.file_to_delete) if st.session_state.delete_type in ["sales", "bc"] else "所有檔案"
-        delete_msg = f"確定要刪除檔案 '{file_name_display}' 嗎？此操作無法恢復。"
-        if st.session_state.delete_type == "all_sales": delete_msg = f"確定要刪除所有 {len(get_file_list(SALES_DIR, '.xlsx'))} 個銷貨檔案嗎？此操作無法恢復。"
-        if st.session_state.delete_type == "all_bc": delete_msg = f"確定要刪除所有 {len(get_file_list(BC_DIR, '.xlsx'))} 個BC檔案嗎？此操作無法恢復。"
-        st.warning(delete_msg)
+def debug_hierarchical_structure(df):
+    """Debug the hierarchical structure of the sales data with order-level and product-level rows."""
+    if df is None or df.empty:
+        st.session_state.debug_info.append("無法檢查分層結構: 數據為空")
+        return
+    
+    try:
+        # Check for a key order column that should be present for order rows
+        key_order_col = '銷貨單號'
         
-        col1, col2 = st.columns([1, 1])
-        with col1: confirm_delete = st.form_submit_button("⚠️ 確認刪除")
-        with col2: cancel_delete = st.form_submit_button("取消")
+        if key_order_col not in df.columns:
+            st.session_state.debug_info.append(f"無法檢查分層結構: 找不到關鍵欄位 '{key_order_col}'")
+            return
         
-        if confirm_delete:
-            deleted_count = 0
-            if st.session_state.delete_type in ["sales", "bc"]:
-                if delete_file(st.session_state.file_to_delete): deleted_count = 1
-            elif st.session_state.delete_type == "all_sales":
-                for file in get_file_list(SALES_DIR, ".xlsx"):
-                    if delete_file(file['path']): deleted_count += 1
-            elif st.session_state.delete_type == "all_bc":
-                 for file in get_file_list(BC_DIR, ".xlsx"):
-                    if delete_file(file['path']): deleted_count += 1
+        # Identify order rows (where key column is not null) and product rows (where key column is null)
+        order_mask = df[key_order_col].notna()
+        
+        # Count order and product rows
+        order_count = order_mask.sum()
+        product_count = len(df) - order_count
+        
+        st.session_state.debug_info.append(f"檔案分層結構: {order_count} 筆訂單行, {product_count} 筆產品行")
+        
+        # Check the pattern of order and product rows
+        # The expectation is: order row, followed by 0+ product rows, then the next order row
+        sequential_errors = 0
+        prev_is_order = None
+        consecutive_orders = 0
+        consecutive_products = 0
+        
+        for i, is_order in enumerate(order_mask):
+            if prev_is_order is not None:
+                if prev_is_order and is_order:
+                    # Two consecutive order rows - could be legitimate but log for awareness
+                    consecutive_orders += 1
+                elif not prev_is_order and not is_order:
+                    # Multiple consecutive product rows - normal
+                    consecutive_products += 1
             
-            st.success(f"已成功刪除 {deleted_count} 個檔案")
-            st.session_state.file_to_delete = None
-            st.session_state.delete_type = None
-            st.rerun()
+            prev_is_order = is_order
         
-        if cancel_delete:
-            st.session_state.file_to_delete = None
-            st.session_state.delete_type = None
-            st.rerun()
+        if consecutive_orders > 0:
+            st.session_state.debug_info.append(f"注意: 檢測到 {consecutive_orders} 次連續的訂單行，請確認數據結構正確")
+        
+        # Sample some order rows
+        if order_count > 0:
+            sample_order_indices = df[order_mask].head(2).index.tolist()
+            for idx in sample_order_indices:
+                sample_row = df.loc[idx]
+                st.session_state.debug_info.append(f"訂單行樣本 (索引 {idx}):")
+                # Show a few key columns from the order row
+                for col in ['銷貨單號', '訂單單號', '銷貨日期', '客戶名稱'][:3]:
+                    if col in sample_row:
+                        st.session_state.debug_info.append(f"  {col}: {sample_row[col]}")
+        
+        # Sample some product rows
+        if product_count > 0:
+            sample_product_indices = df[~order_mask].head(2).index.tolist()
+            for idx in sample_product_indices:
+                sample_row = df.loc[idx]
+                st.session_state.debug_info.append(f"產品行樣本 (索引 {idx}):")
+                # Show a few key columns from the product row
+                for col in ['產品代號', '產品名稱', '數量', '單價'][:3]:
+                    if col in sample_row:
+                        st.session_state.debug_info.append(f"  {col}: {sample_row[col]}")
+    
+    except Exception as e:
+        st.session_state.debug_info.append(f"檢查分層結構時發生錯誤: {e}")
+
+def identify_order_rows(df):
+    """
+    Identify rows that represent order headers in the hierarchical data structure.
+    
+    In the Excel sheet, order rows are those where all order-level columns are populated,
+    while product rows have empty cells in order-level columns.
+    """
+    if df is None or df.empty:
+        st.session_state.debug_info.append("無法識別訂單行: 數據為空")
+        return None
+    
+    try:
+        # Define a key order column that should always be populated for order rows
+        # and null for product rows (e.g., '銷貨單號')
+        key_order_col = '銷貨單號'
+        
+        if key_order_col not in df.columns:
+            st.session_state.debug_info.append(f"識別訂單行失敗: 找不到關鍵欄位 '{key_order_col}'")
+            return None
+        
+        # Create a mask where the key column is not null (identifying order rows)
+        order_mask = df[key_order_col].notna()
+        
+        # Create a Series with row indices as values and their classification
+        # True for order rows, False for product rows
+        row_types = pd.Series(order_mask.values, index=df.index)
+        
+        st.session_state.debug_info.append(f"識別出 {row_types.sum()} 筆訂單行和 {len(row_types) - row_types.sum()} 筆產品行")
+        
+        return row_types
+    
+    except Exception as e:
+        st.session_state.debug_info.append(f"識別訂單行時發生錯誤: {e}")
+        import traceback
+        st.session_state.debug_info.append(f"錯誤詳情: {traceback.format_exc()}")
+        return None
+
+def assign_order_to_products(df, row_types):
+    """
+    Assign each product row to its parent order by creating a mapping from product rows
+    to their respective order rows based on the visual hierarchy in the Excel sheet.
+    """
+    if df is None or df.empty or row_types is None:
+        st.session_state.debug_info.append("無法分配產品到訂單: 輸入數據無效")
+        return None
+    
+    try:
+        # Create a mapping dictionary {product_row_index: order_row_index}
+        order_to_product_map = {}
+        
+        # Get indices of order rows
+        order_indices = row_types[row_types].index.tolist()
+        
+        # For each order row, find all product rows that follow it until the next order row
+        for i in range(len(order_indices)):
+            current_order_idx = order_indices[i]
+            
+            # Determine the end boundary (next order row or end of dataframe)
+            next_order_idx = order_indices[i + 1] if i < len(order_indices) - 1 else len(df)
+            
+            # All rows between current_order_idx and next_order_idx (exclusive) are product rows
+            for product_idx in range(current_order_idx + 1, next_order_idx):
+                # Check if this is indeed a product row (not an order row)
+                if not row_types.get(product_idx, True):  # Default to True if key doesn't exist
+                    order_to_product_map[product_idx] = current_order_idx
+        
+        # Verify the mapping
+        product_count = len(order_to_product_map)
+        expected_product_count = len(row_types) - len(order_indices)
+        
+        st.session_state.debug_info.append(f"已為 {product_count} 筆產品項目分配訂單")
+        
+        if product_count != expected_product_count:
+            st.session_state.debug_info.append(f"警告: 產品分配數量({product_count})與預期數量({expected_product_count})不符")
+        
+        return order_to_product_map
+    
+    except Exception as e:
+        st.session_state.debug_info.append(f"分配產品到訂單時發生錯誤: {e}")
+        import traceback
+        st.session_state.debug_info.append(f"錯誤詳情: {traceback.format_exc()}")
+        return None
+
+def split_data_levels(df):
+    """
+    Split the data into order level and product level information based on the hierarchical 
+    structure in the Excel sheet, where order rows have all order-level columns populated
+    and product rows have empty cells in order-level columns.
+    """
+    if df is None or df.empty:
+        st.session_state.debug_info.append("無法分離訂單和產品層級: 數據為空")
+        return None, None
+    
+    st.session_state.debug_info.append("正在分離訂單層級和產品層級數據...")
+    
+    try:
+        # Check if required columns exist
+        missing_order_cols = [col for col in ORDER_LEVEL_COLUMNS if col not in df.columns]
+        missing_product_cols = [col for col in PRODUCT_LEVEL_COLUMNS if col not in df.columns]
+        
+        if missing_order_cols:
+            st.session_state.debug_info.append(f"缺少訂單層級欄位: {missing_order_cols}")
+        if missing_product_cols:
+            st.session_state.debug_info.append(f"缺少產品層級欄位: {missing_product_cols}")
+        
+        # First check: Verify if the data already has a hierarchical structure identified
+        # in the preprocessing step (preprocess_hierarchical_excel)
+        
+        # We need to re-check how to identify order rows vs product rows
+        # Let's first look at the data structure
+        if '銷貨單號' in df.columns:
+            # Initial check for basic order row identification
+            possible_order_mask = df['銷貨單號'].notna()
+            order_count = possible_order_mask.sum()
+            total_rows = len(df)
+            
+            if 0 < order_count < total_rows:
+                # This looks like a proper hierarchical structure with both order and product rows
+                st.session_state.debug_info.append(f"檢測到分層結構: {order_count} 筆訂單行 和 {total_rows - order_count} 筆產品行")
+                row_types = possible_order_mask
+            else:
+                # If all rows have order numbers, we need a more sophisticated check
+                st.session_state.debug_info.append(f"所有行都有訂單號，嘗試使用產品識別字段進行檢查")
+                
+                # Check if we have product-specific columns that can help identify product rows
+                product_identifier_cols = ['產品代號', '產品名稱', '數量', '單價', '小計']
+                has_product_cols = any(col in df.columns for col in product_identifier_cols)
+                
+                if has_product_cols:
+                    # Use product columns to help identify product vs order rows
+                    for col in product_identifier_cols:
+                        if col in df.columns:
+                            # Check if this column helps distinguish order vs product rows
+                            values_present = df[col].notna()
+                            present_count = values_present.sum()
+                            
+                            # If this column has values for a subset of rows, it might help identify product rows
+                            if 0 < present_count < total_rows:
+                                st.session_state.debug_info.append(f"使用產品欄位 '{col}' 識別產品行")
+                                # Assume rows with product info are product rows, others are order rows
+                                unique_invoice_count = df['銷貨單號'].nunique()
+                                st.session_state.debug_info.append(f"數據中有 {unique_invoice_count} 個唯一訂單號")
+                                
+                                # If the count of unique invoice numbers is close to what we expect for order rows
+                                if abs(unique_invoice_count - order_count) < 0.1 * total_rows:
+                                    # Use this column to help identify product rows
+                                    product_rows = values_present
+                                    row_types = ~product_rows
+                                    st.session_state.debug_info.append(f"根據 '{col}' 識別出 {row_types.sum()} 筆訂單行")
+                                    break
+                
+                # If we still couldn't identify, fall back to unique invoice numbers
+                if 'row_types' not in locals():
+                    # Group by invoice number and only keep the first row of each group as an order row
+                    unique_invoices = df.drop_duplicates(subset=['銷貨單號'])
+                    row_types = df.index.isin(unique_invoices.index)
+                    st.session_state.debug_info.append(f"使用唯一訂單號識別出 {row_types.sum()} 筆訂單行")
+        else:
+            st.session_state.debug_info.append("找不到訂單號欄位，無法識別訂單行")
+            return None, None
+        
+        # Step 2: Create order level dataframe from identified order rows
+        order_df = df[row_types].copy()
+        
+        # Ensure all required order columns are present
+        order_cols = [col for col in ORDER_LEVEL_COLUMNS if col in df.columns]
+        order_df = order_df[order_cols]
+        
+        # Step 3: Create product level dataframe from product rows
+        product_df = df[~row_types].copy()
+        
+        # Ensure numeric columns are properly typed
+        for col in ['總計金額', '毛利', '成本總額']:
+            if col in order_df.columns and not pd.api.types.is_numeric_dtype(order_df[col]):
+                order_df[col] = pd.to_numeric(order_df[col], errors='coerce')
+        
+        # Log the unique order count for verification
+        if '銷貨單號' in order_df.columns:
+            unique_orders = order_df['銷貨單號'].nunique()
+            st.session_state.debug_info.append(f"訂單數據中有 {unique_orders} 個唯一訂單號")
+            
+            # Check if we have duplicated orders
+            if unique_orders < len(order_df):
+                st.session_state.debug_info.append(f"警告: 發現 {len(order_df) - unique_orders} 個重複訂單")
+                
+                # Keep only the first occurrence of each order
+                order_df = order_df.drop_duplicates(subset=['銷貨單號'])
+                st.session_state.debug_info.append(f"移除重複後有 {len(order_df)} 筆訂單")
+        
+        st.session_state.debug_info.append(f"成功建立訂單層級數據，共 {len(order_df)} 筆訂單")
+        
+        # Step 4: Assign each product to its parent order
+        if not product_df.empty:
+            # Create a mapping from order number to order row
+            if '銷貨單號' in order_df.columns and '銷貨單號' in product_df.columns:
+                # Some product rows might already have order number
+                order_map = {}
+                for idx, row in order_df.iterrows():
+                    if pd.notna(row['銷貨單號']):
+                        order_map[row['銷貨單號']] = idx
+                
+                # For products with missing order info, try to find their parent order
+                for idx, row in product_df.iterrows():
+                    if pd.isna(row['銷貨單號']) and idx > 0:
+                        # Look for the closest preceding order row
+                        preceding_orders = [o_idx for o_idx in order_df.index if o_idx < idx]
+                        if preceding_orders:
+                            closest_order_idx = max(preceding_orders)
+                            if closest_order_idx in order_df.index:
+                                product_df.at[idx, '銷貨單號'] = order_df.at[closest_order_idx, '銷貨單號']
+            
+            # Copy order information to product rows for key fields
+            order_keys = ["銷貨日期", "客戶代號", "客戶名稱"]
+            for key in order_keys:
+                if key in order_df.columns and key in product_df.columns:
+                    # Check if values are already present
+                    missing_mask = product_df[key].isna()
+                    if missing_mask.any() and '銷貨單號' in product_df.columns:
+                        # For each product with missing value, look up from parent order
+                        for idx in product_df[missing_mask].index:
+                            order_num = product_df.at[idx, '銷貨單號']
+                            if pd.notna(order_num) and order_num in order_df['銷貨單號'].values:
+                                # Find the order row with this order number
+                                matching_order = order_df[order_df['銷貨單號'] == order_num]
+                                if not matching_order.empty:
+                                    product_df.at[idx, key] = matching_order.iloc[0][key]
+        
+        st.session_state.debug_info.append(f"成功建立產品層級數據，共 {len(product_df)} 筆產品項目")
+        
+        # Debug output - log a sample of order totals to help diagnose inflated totals
+        if not order_df.empty and '總計金額' in order_df.columns:
+            total_sum = order_df['總計金額'].sum()
+            st.session_state.debug_info.append(f"訂單總額核對: {total_sum}")
+            
+            # Show top 5 orders by amount
+            top_orders = order_df.sort_values('總計金額', ascending=False).head(5)
+            st.session_state.debug_info.append("最大金額訂單:")
+            for idx, row in top_orders.iterrows():
+                order_num = row['銷貨單號'] if '銷貨單號' in row else 'Unknown'
+                amount = row['總計金額'] if '總計金額' in row else 0
+                st.session_state.debug_info.append(f"  訂單 {order_num}: {amount}")
+        
+        return order_df, product_df
+        
+    except Exception as e:
+        st.session_state.debug_info.append(f"分離數據層級時發生錯誤: {e}")
+        import traceback
+        st.session_state.debug_info.append(f"錯誤詳情: {traceback.format_exc()}")
+        return None, None
+
+def get_top_products(df, n=50):
+    """
+    Get the top N products from the data based on sales.
+    
+    This function works with the hierarchical data structure where product-level data
+    is identified by rows with product information but potentially missing order-level info.
+    """
+    if df is None or df.empty:
+        st.session_state.debug_info.append("無法獲取熱門產品: 數據為空")
+        return None
+    
+    try:
+        # Log information about the input DataFrame
+        st.session_state.debug_info.append(f"開始分析產品數據，共 {len(df)} 行")
+        
+        # Display available columns to help with debugging
+        st.session_state.debug_info.append(f"可用欄位: {', '.join(df.columns.tolist())}")
+        
+        # Check for presence of required columns
+        required_cols = ["產品代號", "產品名稱", "數量", "小計"]
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        
+        if missing_cols:
+            st.session_state.debug_info.append(f"缺少必要的產品欄位: {missing_cols}")
+            
+            # Try with alternative column names
+            alternative_mappings = {
+                "產品代號": ["商品代號", "品項代號", "SKU", "商品編號"],
+                "產品名稱": ["商品名稱", "品項名稱", "商品說明"],
+                "數量": ["購買數量", "銷售數量", "qty", "quantity"],
+                "小計": ["金額", "總額", "產品金額", "銷售金額", "amount"]
+            }
+            
+            # Check if we can find alternative columns
+            alternative_cols = {}
+            for missing_col in missing_cols:
+                if missing_col in alternative_mappings:
+                    for alt_col in alternative_mappings[missing_col]:
+                        if alt_col in df.columns:
+                            alternative_cols[missing_col] = alt_col
+                            st.session_state.debug_info.append(f"將使用 '{alt_col}' 代替 '{missing_col}'")
+                            break
+            
+            # If we still have missing columns, return None
+            still_missing = [col for col in missing_cols if col not in alternative_cols]
+            if still_missing:
+                st.session_state.debug_info.append(f"無法找到替代欄位: {still_missing}")
+                return None
+            
+            # Create a copy of the DataFrame with renamed columns
+            working_df = df.copy()
+            for original, alternative in alternative_cols.items():
+                working_df[original] = working_df[alternative]
+        else:
+            working_df = df.copy()
+        
+        # Filter for product rows only - in hierarchical data, product rows typically have
+        # product code and name but might be missing some order-level information
+        if '銷貨單號' in working_df.columns:
+            # For product rows in a hierarchical structure, filter appropriate rows
+            # In your data structure, product rows might have empty order-level fields
+            # Check the first few rows to see if we should filter
+            sample_rows = working_df.head(10)
+            has_hierarchical_structure = (sample_rows['產品代號'].notna().sum() > 0 and 
+                                         sample_rows['銷貨單號'].isna().any())
+            
+            if has_hierarchical_structure:
+                st.session_state.debug_info.append("檢測到分層數據結構，將篩選產品層級行")
+                product_rows = working_df[working_df['產品代號'].notna()]
+                st.session_state.debug_info.append(f"篩選後有 {len(product_rows)} 行產品數據")
+            else:
+                product_rows = working_df
+        else:
+            product_rows = working_df
+        
+        # Ensure numeric data types
+        for col in ['數量', '小計']:
+            if not pd.api.types.is_numeric_dtype(product_rows[col]):
+                st.session_state.debug_info.append(f"將 {col} 轉換為數值類型")
+                product_rows[col] = pd.to_numeric(product_rows[col], errors='coerce')
+        
+        # Drop rows with NaN in critical columns
+        product_rows = product_rows.dropna(subset=['產品代號', '產品名稱', '數量', '小計'])
+        st.session_state.debug_info.append(f"清理後有 {len(product_rows)} 行有效產品數據")
+        
+        if product_rows.empty:
+            st.session_state.debug_info.append("清理後沒有有效的產品數據")
+            return None
+        
+        # Sum quantities and amounts by product
+        st.session_state.debug_info.append("開始按產品彙總銷售數據")
+        product_summary = product_rows.groupby(["產品代號", "產品名稱"]).agg({
+            "數量": "sum",
+            "小計": "sum"
+        }).reset_index()
+        
+        st.session_state.debug_info.append(f"彙總後有 {len(product_summary)} 個不同產品")
+        
+        # Sort by sales amount (小計) descending
+        product_summary = product_summary.sort_values("小計", ascending=False)
+        
+        # Take top N products
+        top_products = product_summary.head(n)
+        
+        # Add rank column
+        top_products.insert(0, "排名", range(1, len(top_products) + 1))
+        
+        # Format 小計 for display
+        top_products["小計"] = top_products["小計"].round(2).apply(lambda x: f"{x:,.2f}")
+        
+        st.session_state.debug_info.append(f"成功生成熱門產品列表，共 {len(top_products)} 項")
+        
+        # Show a sample of the top products
+        if len(top_products) > 0:
+            sample = top_products.head(3).to_dict('records')
+            st.session_state.debug_info.append(f"熱門產品範例: {sample}")
+        
+        return top_products
+    
+    except Exception as e:
+        st.session_state.debug_info.append(f"獲取熱門產品時發生錯誤: {e}")
+        import traceback
+        st.session_state.debug_info.append(f"錯誤詳情: {traceback.format_exc()}")
+        return None
+
+def convert_minguo_to_gregorian(date_str):
+    """
+    Convert date string from Minguo calendar (Taiwan) to Gregorian format.
+    Example: "114.03.31" (Minguo) -> "2025-03-31" (Gregorian)
+    """
+    if not isinstance(date_str, str):
+        return None
+    
+    # Handle different separators
+    if '.' in date_str:
+        parts = date_str.split('.')
+    elif '/' in date_str:
+        parts = date_str.split('/')
+    elif '-' in date_str:
+        parts = date_str.split('-')
+    else:
+        return None
+    
+    if len(parts) != 3:
+        return None
+    
+    try:
+        minguo_year = int(parts[0])
+        month = int(parts[1])
+        day = int(parts[2])
+        
+        # Convert Minguo year to Gregorian year (add 1911)
+        gregorian_year = minguo_year + 1911
+        
+        # Return ISO format date string
+        return f"{gregorian_year}-{month:02d}-{day:02d}"
+    except:
+        return None
+
+def clean_numeric_value(value):
+    """
+    Clean numeric values by removing commas and converting to float.
+    Example: "9,603" -> 9603.0
+    """
+    if pd.isna(value):
+        return None
+    
+    if isinstance(value, (int, float)):
+        return float(value)
+    
+    if not isinstance(value, str):
+        return None
+    
+    # Remove commas and other non-numeric characters except for decimal points
+    cleaned = value.replace(',', '')
+    
+    try:
+        return float(cleaned)
+    except:
+        return None
+
+def inspect_and_clean_data(df):
+    """Inspect and clean data, providing details about critical columns."""
+    if df is None or df.empty:
+        st.session_state.debug_info.append("無法檢查數據：數據為空")
+        return None
+    
+    st.session_state.debug_info.append(f"開始檢查和清理數據，原始數據有 {len(df)} 行")
+    
+    # Create a working copy
+    cleaned_df = df.copy()
+    
+    # Check critical columns for report generation
+    critical_columns = ['銷貨日期', '總計金額', '毛利']
+    for col in critical_columns:
+        if col not in cleaned_df.columns:
+            st.session_state.debug_info.append(f"致命錯誤: 缺少必要欄位 {col}")
+            return None
+    
+    # Check and convert 總計金額 column
+    if '總計金額' in cleaned_df.columns:
+        # Display sample values
+        samples = cleaned_df['總計金額'].head(5).tolist()
+        st.session_state.debug_info.append(f"總計金額 樣本值: {samples}")
+        
+        # Check data type
+        original_type = cleaned_df['總計金額'].dtype
+        st.session_state.debug_info.append(f"總計金額 原始類型: {original_type}")
+        
+        # Convert to numeric if needed
+        if not pd.api.types.is_numeric_dtype(cleaned_df['總計金額']):
+            st.session_state.debug_info.append("正在將總計金額轉換為數值類型...")
+            try:
+                # First, try cleaning the values by removing commas
+                cleaned_df['總計金額'] = cleaned_df['總計金額'].apply(clean_numeric_value)
+                
+                # Report conversion results
+                nan_count = cleaned_df['總計金額'].isna().sum()
+                st.session_state.debug_info.append(f"轉換後有 {nan_count} 個空值")
+                new_samples = cleaned_df['總計金額'].head(5).tolist()
+                st.session_state.debug_info.append(f"轉換後的總計金額樣本: {new_samples}")
+            except Exception as e:
+                st.session_state.debug_info.append(f"轉換總計金額時出錯: {e}")
+                return None
+    
+    # Check and convert 毛利 column
+    if '毛利' in cleaned_df.columns:
+        # Display sample values
+        samples = cleaned_df['毛利'].head(5).tolist()
+        st.session_state.debug_info.append(f"毛利 樣本值: {samples}")
+        
+        # Check data type
+        original_type = cleaned_df['毛利'].dtype
+        st.session_state.debug_info.append(f"毛利 原始類型: {original_type}")
+        
+        # Convert to numeric if needed
+        if not pd.api.types.is_numeric_dtype(cleaned_df['毛利']):
+            st.session_state.debug_info.append("正在將毛利轉換為數值類型...")
+            try:
+                # First, try cleaning the values by removing commas
+                cleaned_df['毛利'] = cleaned_df['毛利'].apply(clean_numeric_value)
+                
+                # Report conversion results
+                nan_count = cleaned_df['毛利'].isna().sum()
+                st.session_state.debug_info.append(f"轉換後有 {nan_count} 個空值")
+                new_samples = cleaned_df['毛利'].head(5).tolist()
+                st.session_state.debug_info.append(f"轉換後的毛利樣本: {new_samples}")
+            except Exception as e:
+                st.session_state.debug_info.append(f"轉換毛利時出錯: {e}")
+                return None
+    
+    # Check and convert 銷貨日期 column - special handling for Minguo calendar
+    if '銷貨日期' in cleaned_df.columns:
+        # Display sample values
+        samples = cleaned_df['銷貨日期'].head(5).tolist()
+        st.session_state.debug_info.append(f"銷貨日期 樣本值: {samples}")
+        
+        # Check data type
+        original_type = cleaned_df['銷貨日期'].dtype
+        st.session_state.debug_info.append(f"銷貨日期 原始類型: {original_type}")
+        
+        # Convert to datetime if needed
+        if not pd.api.types.is_datetime64_dtype(cleaned_df['銷貨日期']):
+            st.session_state.debug_info.append("正在將銷貨日期轉換為日期時間類型...")
+            
+            # Check if the date appears to be in Minguo format (Taiwan calendar)
+            date_sample = str(samples[0]) if samples and samples[0] is not None else ""
+            if isinstance(date_sample, str) and '.' in date_sample and len(date_sample.split('.')[0]) <= 3:
+                st.session_state.debug_info.append("檢測到民國日期格式 (例如: 114.03.31)")
+                try:
+                    # Convert Minguo dates to Gregorian dates
+                    gregorian_dates = []
+                    for date_val in cleaned_df['銷貨日期']:
+                        greg_date = convert_minguo_to_gregorian(str(date_val) if date_val is not None else "")
+                        gregorian_dates.append(greg_date)
+                    
+                    # Create a new column with the converted dates
+                    cleaned_df['銷貨日期_公曆'] = gregorian_dates
+                    
+                    # Convert to datetime
+                    cleaned_df['銷貨日期'] = pd.to_datetime(cleaned_df['銷貨日期_公曆'], errors='coerce')
+                    
+                    # Drop the temporary column
+                    cleaned_df = cleaned_df.drop('銷貨日期_公曆', axis=1)
+                    
+                    # Report conversion results
+                    nan_count = cleaned_df['銷貨日期'].isna().sum()
+                    st.session_state.debug_info.append(f"轉換後有 {nan_count} 個空值")
+                    
+                    # Show sample of converted dates
+                    new_samples = cleaned_df['銷貨日期'].head(5).tolist()
+                    st.session_state.debug_info.append(f"民國日期轉換後的樣本: {new_samples}")
+                except Exception as e:
+                    st.session_state.debug_info.append(f"轉換民國日期時出錯: {e}")
+                    import traceback
+                    st.session_state.debug_info.append(f"錯誤詳情: {traceback.format_exc()}")
+            else:
+                # Try standard format conversions
+                try:
+                    if isinstance(date_sample, str) and '/' in date_sample:
+                        st.session_state.debug_info.append("檢測到日期格式包含 '/'")
+                        cleaned_df['銷貨日期'] = pd.to_datetime(cleaned_df['銷貨日期'], format='%Y/%m/%d', errors='coerce')
+                    else:
+                        cleaned_df['銷貨日期'] = pd.to_datetime(cleaned_df['銷貨日期'], errors='coerce')
+                    
+                    # Report conversion results
+                    nan_count = cleaned_df['銷貨日期'].isna().sum()
+                    st.session_state.debug_info.append(f"轉換後有 {nan_count} 個空值")
+                    new_samples = cleaned_df['銷貨日期'].head(5).tolist()
+                    st.session_state.debug_info.append(f"轉換後的銷貨日期樣本: {new_samples}")
+                except Exception as e:
+                    st.session_state.debug_info.append(f"標準日期轉換出錯: {e}")
+    
+    # Extract date components for grouping
+    try:
+        if pd.api.types.is_datetime64_dtype(cleaned_df['銷貨日期']):
+            # Normal processing for datetime fields
+            cleaned_df['年'] = cleaned_df['銷貨日期'].dt.year
+            cleaned_df['月'] = cleaned_df['銷貨日期'].dt.month
+            cleaned_df['年月'] = cleaned_df['銷貨日期'].dt.strftime('%Y-%m')
+            
+            # Check for missing values in the new columns
+            year_na_count = cleaned_df['年'].isna().sum()
+            month_na_count = cleaned_df['月'].isna().sum()
+            yearmonth_na_count = cleaned_df['年月'].isna().sum()
+            
+            st.session_state.debug_info.append(f"日期欄位處理: 年有 {year_na_count} 個空值, 月有 {month_na_count} 個空值, 年月有 {yearmonth_na_count} 個空值")
+            
+            # Show some samples of the derived columns
+            year_samples = cleaned_df['年'].head(5).tolist()
+            month_samples = cleaned_df['月'].head(5).tolist()
+            yearmonth_samples = cleaned_df['年月'].head(5).tolist()
+            
+            st.session_state.debug_info.append(f"年 樣本: {year_samples}")
+            st.session_state.debug_info.append(f"月 樣本: {month_samples}")
+            st.session_state.debug_info.append(f"年月 樣本: {yearmonth_samples}")
+        else:
+            # Manual extraction for dates that failed datetime conversion
+            st.session_state.debug_info.append("銷貨日期轉換失敗，嘗試直接從原始民國日期提取年月...")
+            
+            # Check if we have the original date strings to work with
+            if cleaned_df['銷貨日期'].dtype == 'object':
+                # Extract from Minguo format like "114.03.31"
+                # First, extract the year and add 1911 to convert to Gregorian
+                cleaned_df['年'] = cleaned_df['銷貨日期'].astype(str).str.extract(r'^(\d{1,3})\.').astype(float) + 1911
+                
+                # Extract month
+                cleaned_df['月'] = cleaned_df['銷貨日期'].astype(str).str.extract(r'\.(\d{1,2})\.').astype(float)
+                
+                # Create year-month string in the format YYYY-MM
+                cleaned_df['年月'] = cleaned_df['年'].astype(int).astype(str) + '-' + cleaned_df['月'].astype(int).astype(str).str.zfill(2)
+                
+                # Check results
+                sample_years = cleaned_df['年'].head(5).tolist()
+                sample_months = cleaned_df['月'].head(5).tolist()
+                sample_yearmonths = cleaned_df['年月'].head(5).tolist()
+                
+                st.session_state.debug_info.append(f"手動提取的年樣本: {sample_years}")
+                st.session_state.debug_info.append(f"手動提取的月樣本: {sample_months}")
+                st.session_state.debug_info.append(f"手動提取的年月樣本: {sample_yearmonths}")
+            else:
+                st.session_state.debug_info.append(f"無法識別的日期格式類型: {cleaned_df['銷貨日期'].dtype}")
+                raise ValueError("無法識別的日期格式")
+    
+    except Exception as e:
+        st.session_state.debug_info.append(f"提取日期元素時出錯: {e}")
+        import traceback
+        st.session_state.debug_info.append(f"錯誤詳情: {traceback.format_exc()}")
+        
+        # As a fallback, create year/month columns for order rows based on file name pattern
+        # This assumes file names have a date pattern like "_20250301_" (for March 1, 2025)
+        try:
+            st.session_state.debug_info.append("嘗試從檔案名稱提取日期資訊作為備用...")
+            
+            # Get the current filename from session state if available
+            current_file = st.session_state.get('current_filename', '')
+            
+            # Extract date pattern like "20250301" from the filename
+            import re
+            date_match = re.search(r'_(\d{8})_', current_file)
+            
+            if date_match:
+                date_str = date_match.group(1)
+                year = int(date_str[:4])
+                month = int(date_str[4:6])
+                
+                st.session_state.debug_info.append(f"從檔案名稱 '{current_file}' 中提取的日期: 年={year}, 月={month}")
+                
+                # Assign these values to all rows
+                cleaned_df['年'] = year
+                cleaned_df['月'] = month
+                cleaned_df['年月'] = f"{year}-{month:02d}"
+            else:
+                # Just use current date as last resort
+                st.session_state.debug_info.append("使用當前日期作為備用值")
+                cleaned_df['年'] = datetime.now().year
+                cleaned_df['月'] = datetime.now().month
+                cleaned_df['年月'] = f"{datetime.now().year}-{datetime.now().month:02d}"
+        except Exception as sub_e:
+            st.session_state.debug_info.append(f"從檔案名稱提取日期失敗: {sub_e}")
+            # Absolute last resort - use current date
+            cleaned_df['年'] = datetime.now().year
+            cleaned_df['月'] = datetime.now().month
+            cleaned_df['年月'] = f"{datetime.now().year}-{datetime.now().month:02d}"
+    
+    # Verify critical columns are properly formatted
+    for col in ['總計金額', '毛利']:
+        if col in cleaned_df.columns and not pd.api.types.is_numeric_dtype(cleaned_df[col]):
+            st.session_state.debug_info.append(f"嘗試再次轉換 {col} 為數值類型")
+            try:
+                cleaned_df[col] = pd.to_numeric(cleaned_df[col], errors='coerce')
+            except:
+                st.session_state.debug_info.append(f"致命錯誤: {col} 無法轉換為數值類型")
+                return None
+    
+    # Check for the required columns for grouping
+    if '年月' not in cleaned_df.columns:
+        st.session_state.debug_info.append("致命錯誤: 無法生成年月欄位")
+        return None
+    
+    # Final dataframe stats
+    final_rows = len(cleaned_df)
+    null_counts = {col: cleaned_df[col].isna().sum() for col in ['年月', '總計金額', '毛利'] if col in cleaned_df.columns}
+    st.session_state.debug_info.append(f"數據清理完成，最終數據有 {final_rows} 行")
+    st.session_state.debug_info.append(f"空值統計: {null_counts}")
+    
+    # Check if we have valid data for grouping - only for order-level rows
+    if '銷貨單號' in cleaned_df.columns:
+        valid_mask = cleaned_df['銷貨單號'].notna()
+        valid_rows = cleaned_df[valid_mask].dropna(subset=['年月']).shape[0]
+        st.session_state.debug_info.append(f"有效訂單行數: {valid_rows}")
+        
+        if valid_rows == 0:
+            st.session_state.debug_info.append("警告: 沒有有效的訂單行可以進行匯總")
+            return None
+    else:
+        valid_rows = cleaned_df.dropna(subset=['年月']).shape[0]
+        st.session_state.debug_info.append(f"有效數據行數: {valid_rows}")
+        
+        if valid_rows == 0:
+            st.session_state.debug_info.append("警告: 沒有有效的數據行可以進行匯總")
+            return None
+    
+    return cleaned_df
+
+def preprocess_hierarchical_excel(df):
+    """
+    Preprocess the raw Excel data that has a hierarchical structure with order-level and
+    product-level rows. This function handles the layout pattern where:
+    
+    1. Order rows have populated order-level columns
+    2. Product rows below have empty order-level columns (white space)
+    3. This pattern repeats until the next order row
+    
+    Returns a cleaned dataframe that preserves the hierarchical relationship.
+    """
+    if df is None or df.empty:
+        st.session_state.debug_info.append("預處理數據: 輸入數據為空")
+        return None
+    
+    try:
+        st.session_state.debug_info.append(f"開始預處理分層數據，原始數據有 {len(df)} 行")
+        
+        # First, check if we have the necessary columns
+        order_col_check = '銷貨單號'  # A key column that should be populated for order rows
+        if order_col_check not in df.columns:
+            st.session_state.debug_info.append(f"預處理失敗: 找不到關鍵欄位 '{order_col_check}'")
+            return None
+        
+        # Create a copy to avoid modifying the original
+        processed_df = df.copy()
+        
+        # Identify which rows are order rows (have populated order-level columns)
+        # and which are product rows (have empty order-level columns)
+        order_rows = processed_df[order_col_check].notna()
+        
+        st.session_state.debug_info.append(f"識別出 {order_rows.sum()} 筆訂單行和 {len(order_rows) - order_rows.sum()} 筆產品行")
+        
+        # Now create a column that indicates which order each row belongs to
+        processed_df['order_id_internal'] = None
+        
+        # For each order row, assign its index as the order_id_internal
+        # For product rows, assign the order_id_internal of the previous order
+        current_order_id = None
+        for idx in processed_df.index:
+            if order_rows[idx]:
+                # This is an order row, use its own value as order_id
+                current_order_id = processed_df.at[idx, order_col_check]
+                processed_df.at[idx, 'order_id_internal'] = current_order_id
+            else:
+                # This is a product row, use the current order_id
+                processed_df.at[idx, 'order_id_internal'] = current_order_id
+        
+        # Count how many product rows got assigned to orders
+        assigned_products = processed_df[~order_rows]['order_id_internal'].notna().sum()
+        st.session_state.debug_info.append(f"已為 {assigned_products} 筆產品項目分配訂單")
+        
+        # Now propagate order-level information to product rows that belong to each order
+        for order_col in ORDER_LEVEL_COLUMNS:
+            if order_col in processed_df.columns:
+                # For each group of rows with the same order_id_internal, fill the NaN values
+                # in order columns with the value from the order row
+                # Using ffill() instead of fillna(method='ffill') to avoid FutureWarning
+                processed_df[order_col] = processed_df.groupby('order_id_internal')[order_col].transform(
+                    lambda x: x.ffill()
+                )
+        
+        # Drop the temporary column
+        processed_df = processed_df.drop('order_id_internal', axis=1)
+        
+        st.session_state.debug_info.append(f"預處理完成，保留了 {len(processed_df)} 行數據")
+        return processed_df
+        
+    except Exception as e:
+        st.session_state.debug_info.append(f"預處理分層數據時發生錯誤: {e}")
+        import traceback
+        st.session_state.debug_info.append(f"錯誤詳情: {traceback.format_exc()}")
+        return None
+
+def process_sales_data(df_list, filenames=None):
+    """
+    Process sales data from multiple DataFrames with hierarchical structure.
+    The filenames parameter is used to extract date information as a fallback.
+    """
+    if not df_list:
+        st.session_state.debug_info.append("處理銷售數據: 沒有提供數據框")
+        return None
+    
+    # Store filenames for potential date extraction
+    if filenames and len(filenames) > 0:
+        st.session_state.current_filename = filenames[0]
+        st.session_state.debug_info.append(f"設定當前檔案名稱: {st.session_state.current_filename}")
+    
+    # Combine all DataFrames
+    try:
+        # Process each dataframe to handle the hierarchical structure before combining
+        processed_dfs = []
+        for i, df in enumerate(df_list):
+            current_file = filenames[i] if filenames and i < len(filenames) else f"檔案 {i+1}"
+            st.session_state.debug_info.append(f"正在處理 {current_file}，原始行數: {len(df)}")
+            processed_df = preprocess_hierarchical_excel(df)
+            if processed_df is not None:
+                processed_dfs.append(processed_df)
+        
+        if not processed_dfs:
+            st.session_state.debug_info.append("預處理後沒有可用的數據框")
+            return None
+        
+        # Combine the processed DataFrames
+        combined_df = pd.concat(processed_dfs, ignore_index=True)
+        st.session_state.debug_info.append(f"成功合併 {len(processed_dfs)} 個處理後的數據檔案，共 {len(combined_df)} 行")
+        
+        # Check for any data in the DataFrame
+        if combined_df.empty:
+            st.session_state.debug_info.append("合併後的銷售數據為空")
+            return None
+        
+        # Inspect and clean the data
+        cleaned_df = inspect_and_clean_data(combined_df)
+        
+        # Split into order and product level
+        if cleaned_df is not None:
+            order_df, product_df = split_data_levels(cleaned_df)
+            st.session_state.processed_data['order_level'] = order_df
+            st.session_state.processed_data['product_level'] = product_df
+            
+            # Show order level stats
+            if order_df is not None and not order_df.empty:
+                # Count non-null values in key columns
+                totals_count = order_df['總計金額'].notna().sum()
+                profit_count = order_df['毛利'].notna().sum()
+                date_count = order_df['銷貨日期'].notna().sum()
+                
+                st.session_state.debug_info.append(f"訂單層級統計: {len(order_df)} 筆訂單")
+                st.session_state.debug_info.append(f"訂單層級有效值: 總計金額 {totals_count}, 毛利 {profit_count}, 銷貨日期 {date_count}")
+        
+        return cleaned_df
+        
+    except Exception as e:
+        st.session_state.debug_info.append(f"處理銷售數據時發生錯誤: {e}")
+        import traceback
+        st.session_state.debug_info.append(f"錯誤詳情: {traceback.format_exc()}")
+        return None
+
+def generate_monthly_sales_report(df):
+    """
+    Generate monthly sales report from processed data.
+    
+    This function is designed to work with hierarchical data where order-level
+    rows contain sales totals and dates. Only the order-level rows should be used
+    for generating the monthly summary to avoid double-counting.
+    """
+    # 非常重要：直接使用已處理的訂單層級數據，而不是傳入的 df
+    if st.session_state.processed_data['order_level'] is not None:
+        # 使用訂單層級數據
+        order_df = st.session_state.processed_data['order_level'].copy()
+        st.session_state.debug_info.append(f"直接使用訂單層級數據：{len(order_df)} 行，而非完整資料 {len(df)} 行")
+    else:
+        st.session_state.debug_info.append("無法找到訂單層級數據")
+        return None
+    
+    # 檢查必要欄位
+    if not all(col in order_df.columns for col in ['年月', '總計金額', '毛利']):
+        st.session_state.debug_info.append("訂單層級數據缺少必要欄位")
+        return None
+    
+    # 記錄總金額作為參考
+    total_amount = order_df['總計金額'].sum()
+    st.session_state.debug_info.append(f"訂單層級總計金額：{total_amount}")
+    
+    # 按月份分組
+    monthly_report = order_df.groupby('年月').agg({
+        '總計金額': 'sum',
+        '毛利': 'sum'
+    }).reset_index()
+    
+    # 計算毛利率
+    monthly_report['毛利率'] = (monthly_report['毛利'] / monthly_report['總計金額']) * 100
+    
+    # 排序
+    monthly_report = monthly_report.sort_values('年月')
+    
+    # 紀錄結果
+    st.session_state.debug_info.append(f"月度報表生成成功，共 {len(monthly_report)} 個月份")
+    st.session_state.debug_info.append(f"月度報表總計金額：{monthly_report['總計金額'].sum()}")
+    
+    # 顯示樣本
+    sample_data = monthly_report.head().to_dict('records')
+    st.session_state.debug_info.append(f"月度報表樣本：{sample_data}")
+    
+    # 儲存到 session state
+    st.session_state.processed_data['monthly_summary'] = monthly_report
+    
+    return monthly_report
+
+def create_sales_charts(df):
+    """Create visualizations for sales data."""
+    if df is None or df.empty:
+        st.session_state.debug_info.append("無法生成圖表: 輸入數據為空")
+        return None, None
+    
+    try:
+        # Ensure data is properly formatted for charts
+        if '年月' not in df.columns or '總計金額' not in df.columns or '毛利' not in df.columns:
+            st.session_state.debug_info.append(f"繪製圖表失敗: 缺少必要欄位。現有欄位: {df.columns.tolist()}")
+            return None, None
+        
+        # Monthly sales trend chart
+        sales_fig = px.line(
+            df, x='年月', y='總計金額', 
+            title='月度營業額趨勢',
+            labels={'年月': '年月', '總計金額': '營業額 (元)'},
+            markers=True
+        )
+        sales_fig.update_layout(
+            xaxis_title='年月',
+            yaxis_title='營業額 (元)',
+            height=400
+        )
+        
+        # Monthly profit trend chart
+        profit_fig = px.line(
+            df, x='年月', y=['毛利', '毛利率'], 
+            title='月度毛利趨勢',
+            labels={'年月': '年月', 'value': '金額/百分比', 'variable': '指標'},
+            markers=True
+        )
+        profit_fig.update_layout(
+            xaxis_title='年月',
+            yaxis_title='金額/百分比',
+            height=400
+        )
+        
+        st.session_state.debug_info.append("圖表生成成功")
+        return sales_fig, profit_fig
+        
+    except Exception as e:
+        st.session_state.debug_info.append(f"生成圖表時發生錯誤: {e}")
+        return None, None
+
+def create_monthly_comparison_chart(order_df):
+    """
+    Create a daily revenue comparison chart for multiple months.
+    Each month will be represented by a different colored line.
+    
+    Args:
+        order_df: DataFrame containing order-level data with dates and amounts
+    
+    Returns:
+        A plotly figure object with the comparison chart
+    """
+    if order_df is None or order_df.empty:
+        st.session_state.debug_info.append("無法生成月度比較圖表: 訂單數據為空")
+        return None
+    
+    try:
+        # Check if required columns exist
+        if '銷貨日期' not in order_df.columns or '總計金額' not in order_df.columns:
+            st.session_state.debug_info.append("生成月度比較圖表失敗: 缺少銷貨日期或總計金額欄位")
+            return None
+        
+        # Ensure date column is datetime type
+        if not pd.api.types.is_datetime64_dtype(order_df['銷貨日期']):
+            st.session_state.debug_info.append("將銷貨日期轉換為日期時間格式以進行比較")
+            order_df['銷貨日期'] = pd.to_datetime(order_df['銷貨日期'], errors='coerce')
+        
+        # Extract year-month and day for grouping
+        order_df['年月'] = order_df['銷貨日期'].dt.strftime('%Y-%m')
+        order_df['日'] = order_df['銷貨日期'].dt.day
+        
+        # Get unique months
+        months = order_df['年月'].unique()
+        
+        # If there's only one month, we can't do a comparison
+        if len(months) <= 1:
+            st.session_state.debug_info.append(f"只有一個月份的數據 ({months[0]})，無法進行比較")
+            return None
+        
+        st.session_state.debug_info.append(f"找到 {len(months)} 個不同月份: {', '.join(months)}")
+        
+        # Group by year-month and day, summing the total amount
+        daily_sales = order_df.groupby(['年月', '日'])['總計金額'].sum().reset_index()
+        
+        # Create figure
+        fig = go.Figure()
+        
+        # Add a line for each month with different colors
+        for month in months:
+            month_data = daily_sales[daily_sales['年月'] == month].copy()
+            
+            # Skip if no data for this month
+            if month_data.empty:
+                continue
+                
+            # Sort by day
+            month_data = month_data.sort_values('日')
+            
+            # Add line with month name in legend
+            fig.add_trace(go.Scatter(
+                x=month_data['日'],
+                y=month_data['總計金額'],
+                mode='lines+markers',
+                name=month,
+                hovertemplate='日期: %{x}日<br>金額: $%{y:,.2f}'
+            ))
+        
+        # Update layout
+        fig.update_layout(
+            title='各月份每日銷售金額比較',
+            xaxis_title='日期',
+            yaxis_title='銷售金額 (元)',
+            legend_title='月份',
+            xaxis=dict(
+                tickmode='linear',
+                tick0=1,
+                dtick=1
+            ),
+            height=500,
+            margin=dict(l=40, r=40, t=50, b=40)
+        )
+        
+        return fig
+        
+    except Exception as e:
+        st.session_state.debug_info.append(f"生成月度比較圖表時發生錯誤: {e}")
+        import traceback
+        st.session_state.debug_info.append(f"錯誤詳情: {traceback.format_exc()}")
+        return None
+
+def create_monthly_comparison_table(monthly_summary):
+    """
+    Create a comparison table for monthly sales data.
+    
+    Args:
+        monthly_summary: DataFrame containing monthly summary data
+    
+    Returns:
+        A formatted DataFrame for display
+    """
+    if monthly_summary is None or monthly_summary.empty:
+        st.session_state.debug_info.append("無法生成月度比較表: 月度摘要數據為空")
+        return None
+    
+    try:
+        # Check if required columns exist
+        required_cols = ['年月', '總計金額', '毛利']
+        missing_cols = [col for col in required_cols if col not in monthly_summary.columns]
+        if missing_cols:
+            st.session_state.debug_info.append(f"生成月度比較表失敗: 缺少必要欄位 {', '.join(missing_cols)}")
+            return None
+        
+        # Make a copy to avoid modifying the original
+        comparison_df = monthly_summary.copy()
+        
+        # Sort by year-month
+        comparison_df = comparison_df.sort_values('年月')
+        
+        # Create growth rate columns
+        comparison_df['銷售成長率'] = comparison_df['總計金額'].pct_change() * 100
+        comparison_df['毛利成長率'] = comparison_df['毛利'].pct_change() * 100
+        
+        # Calculate month-over-month growth for each row
+        if '毛利' in comparison_df.columns and '總計金額' in comparison_df.columns:
+            comparison_df['毛利率'] = (comparison_df['毛利'] / comparison_df['總計金額']) * 100
+            comparison_df['毛利率變化'] = comparison_df['毛利率'].diff()
+        
+        # Format currency columns
+        for col in ['總計金額', '毛利']:
+            if col in comparison_df.columns:
+                comparison_df[col] = comparison_df[col].map('${:,.2f}'.format)
+        
+        # Format percentage columns
+        for col in ['銷售成長率', '毛利成長率']:
+            if col in comparison_df.columns:
+                comparison_df[col] = comparison_df[col].map('{:+.2f}%'.format)
+        
+        if '毛利率' in comparison_df.columns:
+            comparison_df['毛利率'] = comparison_df['毛利率'].map('{:.2f}%'.format)
+        
+        if '毛利率變化' in comparison_df.columns:
+            comparison_df['毛利率變化'] = comparison_df['毛利率變化'].map('{:+.2f}%'.format)
+        
+        # Rename columns for display
+        column_rename = {
+            '年月': '月份',
+            '總計金額': '總銷售額',
+            '毛利': '總毛利',
+            '毛利率': '毛利率',
+            '銷售成長率': '銷售成長',
+            '毛利成長率': '毛利成長',
+            '毛利率變化': '毛利率變化'
+        }
+        
+        display_df = comparison_df.rename(columns=column_rename)
+        
+        # Reorder columns for clarity
+        column_order = ['月份', '總銷售額', '銷售成長', '總毛利', '毛利成長', '毛利率', '毛利率變化']
+        display_df = display_df[[col for col in column_order if col in display_df.columns]]
+        
+        return display_df
+        
+    except Exception as e:
+        st.session_state.debug_info.append(f"生成月度比較表時發生錯誤: {e}")
+        import traceback
+        st.session_state.debug_info.append(f"錯誤詳情: {traceback.format_exc()}")
+        return None
+
+# --------------------------------------------------
+# 📊 STREAMLIT UI ---------------------------------
+# --------------------------------------------------
+
+# Setup sidebar for all functionality
+with st.sidebar:
+    st.header("資料上傳")
+    
+    # Data structure definitions (expandable)
+    with st.expander("數據欄位定義", expanded=False):
+        # Order Level Tab
+        st.markdown("#### 訂單層級欄位定義")
+        for col in ORDER_LEVEL_COLUMNS:
+            definition = COLUMN_DEFINITIONS.get(col, "無描述")
+            st.markdown(f"**{col}**: {definition}")
+        
+        st.markdown("---")
+        
+        # Product Level Tab
+        st.markdown("#### 產品層級欄位定義")
+        for col in PRODUCT_LEVEL_COLUMNS:
+            definition = COLUMN_DEFINITIONS.get(col, "無描述")
+            st.markdown(f"**{col}**: {definition}")
+        
+        st.markdown("---")
+        
+        # BC Tab
+        st.markdown("#### BC 產品欄位定義")
+        for col in BC_COLUMNS:
+            if col not in ORDER_LEVEL_COLUMNS and col not in PRODUCT_LEVEL_COLUMNS:
+                definition = COLUMN_DEFINITIONS.get(col, "無描述")
+                st.markdown(f"**{col}**: {definition}")
+    
+    # Sales Data Section
+    st.markdown("### 銷貨資料上傳")
+    with st.expander("必要欄位列表", expanded=False):
+        st.markdown("""
+        **訂單層級欄位：**
+        銷貨單號, 訂單單號, 銷貨日期, 客戶代號, 客戶名稱, 部門代號, 部門名稱, 發票號碼, 
+        未稅小計, 營業稅, 折讓金額, 稅前折價, 總計金額, 實收總額, 成本總額, 毛利, 毛利率
+        
+        **產品層級欄位：**
+        產品代號, 產品名稱, 倉別代號, 倉別名稱, 數量, 單位, 單價, 小計, 成本總值, 產品毛利, 
+        產品毛利率, 銷售單價1, 精準成本, 精準毛利, 單位管銷成本, 管銷成本合計, *銷貨日期, 
+        *客戶代號, *客戶條件, *部門代號, *業務代號, *業務條件
+        """)
+    
+    sales_view = st.radio(
+        "選擇操作:",
+        ["上傳新檔案", "使用已上傳的檔案"],
+        horizontal=True,
+        key="sales_view_option",
+        label_visibility="collapsed"
+    )
+    
+    if sales_view == "上傳新檔案":
+        sales_files = st.file_uploader(
+            "上傳銷貨單毛利分析表 (可多選)",
+            type=["xlsx", "xls"],
+            accept_multiple_files=True,
+            key="sales_uploader"
+        )
+        
+        if sales_files:
+            saved_paths = []
+            with st.spinner("正在儲存上傳的銷貨檔案..."):
+                for file in sales_files:
+                    saved_path = save_uploaded_file(file, UPLOADED_SALES_DIR)
+                    if saved_path: 
+                        saved_paths.append(saved_path)
+                        
+            if len(saved_paths) == len(sales_files):
+                st.success(f"已成功儲存 {len(saved_paths)} 個銷貨檔案。")
+                st.session_state.sales_files_uploaded = True
+                
+                # Load and process data
+                try:
+                    dfs = []
+                    filenames = []
+                    for file in sales_files:
+                        try:
+                            df = pd.read_excel(file)
+                            if not df.empty:
+                                dfs.append(df)
+                                filenames.append(file.name)
+                                st.session_state.debug_info.append(f"成功讀取 {file.name}，有 {len(df)} 行")
+                            else:
+                                st.session_state.debug_info.append(f"警告: {file.name} 檔案為空")
+                        except Exception as e:
+                            st.session_state.debug_info.append(f"讀取 {file.name} 時發生錯誤: {e}")
+                    
+                    if dfs:
+                        st.session_state.sales_data = process_sales_data(dfs, filenames)
+                        generate_monthly_sales_report(st.session_state.sales_data)
+                    else:
+                        st.session_state.debug_info.append("沒有成功讀取任何銷售檔案")
+                except Exception as e:
+                    st.session_state.debug_info.append(f"處理銷售檔案時發生錯誤: {e}")
+            else: 
+                st.warning("部分銷貨檔案儲存失敗。")
+            
+            # Show preview of the first file
+            if sales_files:
+                with st.expander("資料預覽 (首個檔案)"):
+                    try:
+                        preview_df = pd.read_excel(sales_files[0])
+                        st.dataframe(preview_df.head())
+                        
+                        # Display sample values from important columns
+                        if not preview_df.empty:
+                            st.write("重要欄位樣本:")
+                            for col in ['銷貨日期', '總計金額', '毛利']:
+                                if col in preview_df.columns:
+                                    st.write(f"{col} 前5筆: {preview_df[col].head().tolist()}")
+                                    st.write(f"{col} 數據類型: {preview_df[col].dtype}")
+                    except Exception as e:
+                        st.error(f"預覽檔案時發生錯誤: {e}")
+    else:
+        available_sales_files = get_uploaded_files(UPLOADED_SALES_DIR)
+        if not available_sales_files:
+            st.info(f"'{UPLOADED_SALES_DIR}' 目錄下沒有找到任何銷貨檔案。")
+            st.session_state.sales_files_uploaded = False
+        else:
+            selected_files = st.multiselect(
+                "選擇要使用的檔案:",
+                options=available_sales_files
+            )
+            
+            if selected_files:
+                st.session_state.sales_files_uploaded = True
+                
+                # Load and process selected files
+                try:
+                    dfs = []
+                    filenames = []
+                    for file in selected_files:
+                        file_path = os.path.join(UPLOADED_SALES_DIR, file)
+                        try:
+                            df = pd.read_excel(file_path)
+                            if not df.empty:
+                                dfs.append(df)
+                                filenames.append(file)
+                                st.session_state.debug_info.append(f"成功讀取 {file}，有 {len(df)} 行")
+                            else:
+                                st.session_state.debug_info.append(f"警告: {file} 檔案為空")
+                        except Exception as e:
+                            st.session_state.debug_info.append(f"讀取檔案 '{file}' 時發生錯誤: {e}")
+                    
+                    if dfs:
+                        st.session_state.sales_data = process_sales_data(dfs, filenames)
+                        generate_monthly_sales_report(st.session_state.sales_data)
+                    else:
+                        st.session_state.debug_info.append("沒有成功讀取任何銷售檔案")
+                except Exception as e:
+                    st.session_state.debug_info.append(f"處理銷售檔案時發生錯誤: {e}")
+                
+                # Show preview of first selected file
+                if selected_files:
+                    with st.expander(f"資料預覽: {selected_files[0]}"):
+                        try:
+                            file_path = os.path.join(UPLOADED_SALES_DIR, selected_files[0])
+                            preview_df = pd.read_excel(file_path)
+                            st.dataframe(preview_df.head())
+                            
+                            # Display sample values from important columns
+                            if not preview_df.empty:
+                                st.write("重要欄位樣本:")
+                                for col in ['銷貨日期', '總計金額', '毛利']:
+                                    if col in preview_df.columns:
+                                        st.write(f"{col} 前5筆: {preview_df[col].head().tolist()}")
+                                        st.write(f"{col} 數據類型: {preview_df[col].dtype}")
+                        except Exception as e:
+                            st.error(f"預覽檔案時發生錯誤: {e}")
+    
+    st.markdown("---")
+    
+    # BC Inventory Data Section
+    st.markdown("### BC 產品資料上傳")
+    with st.expander("必要欄位列表", expanded=False):
+        st.markdown("""
+        **必要欄位：**
+        產品代號, 產品名稱, 數量, 倉庫, 單位, 成本單價, 成本總價, 安全存量, 廠商代號, 
+        廠商簡稱, 最後出貨日, 最後進貨日, 銷售單價1, 銷售單價2, 銷售單價3, 銷售單價4, 
+        最低售價, 數量為零自動下架, 持續上架, 停止上架, 大類名稱, 中類名稱, 小類名稱, 
+        備註, EAN13碼, CO128碼, 建議售價, 毛利率
+        """)
+    
+    bc_view = st.radio(
+        "選擇操作:",
+        ["上傳新檔案", "使用已上傳的檔案"],
+        horizontal=True,
+        key="bc_view_option",
+        label_visibility="collapsed"
+    )
+    
+    if bc_view == "上傳新檔案":
+        bc_file = st.file_uploader(
+            "上傳 BC 產品 SKU 表",
+            type=["xlsx", "xls"],
+            key="bc_uploader"
+        )
+        
+        if bc_file:
+            with st.spinner("正在儲存上傳的 BC 檔案..."):
+                saved_bc_path = save_uploaded_file(bc_file, UPLOADED_BC_DIR)
+            
+            if saved_bc_path: 
+                st.success(f"已成功儲存 BC 檔案: {bc_file.name}")
+                st.session_state.bc_file_uploaded = True
+                
+                # Load BC data
+                try:
+                    st.session_state.bc_data = pd.read_excel(bc_file)
+                    st.session_state.debug_info.append(f"成功讀取 BC 檔案 {bc_file.name}，有 {len(st.session_state.bc_data)} 行")
+                except Exception as e:
+                    st.session_state.debug_info.append(f"讀取 BC 檔案時發生錯誤: {e}")
+            else: 
+                st.error("儲存 BC 檔案失敗。")
+            
+            # Show preview
+            with st.expander("資料預覽"):
+                try:
+                    preview_bc_df = pd.read_excel(bc_file)
+                    st.dataframe(preview_bc_df.head())
+                except Exception as e:
+                    st.error(f"預覽 BC 檔案時發生錯誤: {e}")
+    else:
+        available_bc_files = get_uploaded_files(UPLOADED_BC_DIR)
+        if not available_bc_files:
+            st.info(f"'{UPLOADED_BC_DIR}' 目錄下沒有找到任何 BC 檔案。")
+            st.session_state.bc_file_uploaded = False
+        else:
+            selected_bc_file = st.selectbox(
+                "選擇要使用的 BC 檔案:",
+                options=["請選擇..."] + available_bc_files,
+                key="bc_file_selector"
+            )
+            
+            if selected_bc_file and selected_bc_file != "請選擇...":
+                st.session_state.bc_file_uploaded = True
+                
+                # Load selected BC file
+                file_path = os.path.join(UPLOADED_BC_DIR, selected_bc_file)
+                try:
+                    st.session_state.bc_data = pd.read_excel(file_path)
+                    st.session_state.debug_info.append(f"成功讀取 BC 檔案 {selected_bc_file}，有 {len(st.session_state.bc_data)} 行")
+                except Exception as e:
+                    st.session_state.debug_info.append(f"讀取 BC 檔案時發生錯誤: {e}")
+                
+                with st.expander(f"預覽: {selected_bc_file}"):
+                    try:
+                        preview_bc_df = pd.read_excel(file_path)
+                        st.dataframe(preview_bc_df.head())
+                    except Exception as e:
+                        st.error(f"預覽 BC 檔案時發生錯誤: {e}")
+    
+    st.markdown("---")
+    
+    # Generate button in sidebar
+    if st.button("分析並更新報表", key="analyze_button", help="分析數據並生成報表", use_container_width=True, type="primary"):
+        st.session_state.analyze_triggered = True
+        st.session_state.debug_info = []  # Reset debug info on new analysis
+        st.session_state.debug_info.append("開始新的分析...")
+        
+        # Run analysis when button is clicked
+        if st.session_state.sales_data is not None:
+            generate_monthly_sales_report(st.session_state.sales_data)
+    else:
+        if 'analyze_triggered' not in st.session_state:
+            st.session_state.analyze_triggered = False
+    
+    # Debug toggle
+    show_debug = st.checkbox("顯示除錯資訊", value=True)
+    
+    # Show debug information if enabled
+    if show_debug and st.session_state.debug_info:
+        with st.expander("除錯資訊", expanded=True):
+            for info in st.session_state.debug_info:
+                st.text(info)
+
+# Main content area
+# Page title
+st.markdown("<h1 style='text-align: center;'>數據圖表生成器</h1>", unsafe_allow_html=True)
+
+# Display processing status directly without showing data structure information
+
+# Display processing status
+status_cols = st.columns(3)
+
+with status_cols[0]:
+    if st.session_state.processed_data['order_level'] is not None:
+        st.success(f"已成功處理 {len(st.session_state.processed_data['order_level'])} 筆訂單資料")
+    
+with status_cols[1]:
+    if st.session_state.processed_data['product_level'] is not None:
+        st.success(f"已成功處理 {len(st.session_state.processed_data['product_level'])} 筆產品資料")
+    
+with status_cols[2]:
+    if st.session_state.processed_data['monthly_summary'] is not None:
+        st.success(f"已生成 {len(st.session_state.processed_data['monthly_summary'])} 個月的銷售報表")
+
+# Add a big visual for the total 總計金額
+if st.session_state.processed_data['order_level'] is not None:
+    # Get the order-level data
+    order_df = st.session_state.processed_data['order_level']
+    
+    # Debug the processed data
+    st.session_state.debug_info.append(f"計算總計金額: 訂單資料有 {len(order_df)} 行")
+    if '銷貨單號' in order_df.columns:
+        unique_orders = order_df['銷貨單號'].nunique()
+        st.session_state.debug_info.append(f"計算總計金額: 有 {unique_orders} 個唯一訂單號")
+    
+    # Use 總計金額 (Total Amount) for the total sales revenue after taxes
+    if '總計金額' in order_df.columns:
+        # Ensure the value is numeric before formatting
+        try:
+            # Convert to numeric if not already
+            if not pd.api.types.is_numeric_dtype(order_df['總計金額']):
+                order_df['總計金額'] = pd.to_numeric(order_df['總計金額'], errors='coerce')
+            
+            # Check for duplicates in order data
+            if '銷貨單號' in order_df.columns:
+                has_duplicates = order_df['銷貨單號'].duplicated().any()
+                if has_duplicates:
+                    st.session_state.debug_info.append("警告: 發現重複訂單號，使用去重複後的數據計算總額")
+                    # Use unique orders to calculate totals
+                    unique_order_df = order_df.drop_duplicates(subset=['銷貨單號'])
+                    total_amount = unique_order_df['總計金額'].sum()
+                    
+                    # Log for diagnostics
+                    st.session_state.debug_info.append(f"去重複前總額: {order_df['總計金額'].sum()}")
+                    st.session_state.debug_info.append(f"去重複後總額: {total_amount}")
+                else:
+                    total_amount = order_df['總計金額'].sum()
+            else:
+                total_amount = order_df['總計金額'].sum()
+            
+            # Sample of order amounts for verification
+            sample_amounts = order_df['總計金額'].sample(min(5, len(order_df))).tolist()
+            st.session_state.debug_info.append(f"訂單金額樣本: {sample_amounts}")
+            
+            # Format the number for display
+            formatted_amount = f"${total_amount:,.2f}" if pd.notna(total_amount) else "$0.00"
+            
+            # Display the total in a large, prominent format
+            st.markdown("### 銷售總覽")
+            
+            # Use a container with border and styling
+            with st.container(border=True):
+                # Create a big centered header for the total
+                st.markdown(
+                    f"""
+                    <div style="text-align: center; padding: 2rem 0;">
+                        <h2 style="font-size: 1.5rem; color: #555;">總銷售金額 (總計金額)</h2>
+                        <h1 style="font-size: 3rem; font-weight: bold; color: #0f5132;">{formatted_amount}</h1>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+        except Exception as e:
+            st.error(f"計算實收總額時發生錯誤: {e}")
+            st.markdown("### 銷售總覽")
+            with st.container(border=True):
+                st.markdown(
+                    """
+                    <div style="text-align: center; padding: 2rem 0;">
+                        <h2 style="font-size: 1.5rem; color: #555;">總銷售金額 (實收總額)</h2>
+                        <h1 style="font-size: 3rem; font-weight: bold; color: #0f5132;">$0.00</h1>
+                        <p style="color: #dc3545;">無法計算總額，請檢查數據格式</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+        
+        # If we have profit data, show that as well
+        if '毛利' in order_df.columns:
+            try:
+                # Ensure the value is numeric before formatting
+                if not pd.api.types.is_numeric_dtype(order_df['毛利']):
+                    order_df['毛利'] = pd.to_numeric(order_df['毛利'], errors='coerce')
+                
+                # Use the same approach as for total_amount to handle potential duplicates
+                if '銷貨單號' in order_df.columns and order_df['銷貨單號'].duplicated().any():
+                    # Use unique orders to calculate totals
+                    unique_order_df = order_df.drop_duplicates(subset=['銷貨單號'])
+                    total_profit = unique_order_df['毛利'].sum()
+                    
+                    # Log for diagnostics
+                    st.session_state.debug_info.append(f"去重複前毛利總額: {order_df['毛利'].sum()}")
+                    st.session_state.debug_info.append(f"去重複後毛利總額: {total_profit}")
+                else:
+                    total_profit = order_df['毛利'].sum()
+                
+                # Sample of profit amounts for verification
+                sample_profits = order_df['毛利'].sample(min(5, len(order_df))).tolist()
+                st.session_state.debug_info.append(f"毛利樣本: {sample_profits}")
+                
+                # Format for display
+                formatted_profit = f"${total_profit:,.2f}" if pd.notna(total_profit) else "$0.00"
+                
+                # Display the total gross profit
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    with st.container(border=True):
+                        st.markdown(
+                            f"""
+                            <div style="text-align: center; padding: 1rem 0;">
+                                <h3 style="font-size: 1.2rem; color: #555;">總毛利</h3>
+                                <h2 style="font-size: 2rem; font-weight: bold; color: #0d6efd;">{formatted_profit}</h2>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                
+                # For profit margin, use the average of the 毛利率 column if available
+                if '毛利率' in order_df.columns:
+                    try:
+                        # Ensure the value is numeric before calculating
+                        if not pd.api.types.is_numeric_dtype(order_df['毛利率']):
+                            order_df['毛利率'] = pd.to_numeric(order_df['毛利率'], errors='coerce')
+                            
+                        # Use the same DataFrame as for other calculations
+                        if '銷貨單號' in order_df.columns and order_df['銷貨單號'].duplicated().any():
+                            unique_order_df = order_df.drop_duplicates(subset=['銷貨單號'])
+                            avg_profit_margin = unique_order_df['毛利率'].dropna().mean()
+                        else:
+                            avg_profit_margin = order_df['毛利率'].dropna().mean()
+                        
+                        # Format for display
+                        formatted_margin = f"{avg_profit_margin:.2f}%" if pd.notna(avg_profit_margin) else "0.00%"
+                        
+                        with col2:
+                            with st.container(border=True):
+                                st.markdown(
+                                    f"""
+                                    <div style="text-align: center; padding: 1rem 0;">
+                                        <h3 style="font-size: 1.2rem; color: #555;">平均毛利率</h3>
+                                        <h2 style="font-size: 2rem; font-weight: bold; color: #d63384;">{formatted_margin}</h2>
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True
+                                )
+                    except Exception as e:
+                        st.error(f"計算平均毛利率時發生錯誤: {e}")
+                        with col2:
+                            with st.container(border=True):
+                                st.markdown(
+                                    """
+                                    <div style="text-align: center; padding: 1rem 0;">
+                                        <h3 style="font-size: 1.2rem; color: #555;">平均毛利率</h3>
+                                        <h2 style="font-size: 2rem; font-weight: bold; color: #d63384;">0.00%</h2>
+                                        <p style="color: #dc3545;">無法計算毛利率，請檢查數據格式</p>
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True
+                                )
+                else:
+                    # Calculate profit margin from 毛利 and 總計金額 if 毛利率 column is not available
+                    try:
+                        profit_margin = (total_profit / total_amount * 100) if total_amount > 0 else 0
+                        
+                        # Format for display
+                        formatted_margin = f"{profit_margin:.2f}%" if pd.notna(profit_margin) else "0.00%"
+                        
+                        with col2:
+                            with st.container(border=True):
+                                st.markdown(
+                                    f"""
+                                    <div style="text-align: center; padding: 1rem 0;">
+                                        <h3 style="font-size: 1.2rem; color: #555;">計算毛利率</h3>
+                                        <h2 style="font-size: 2rem; font-weight: bold; color: #d63384;">{formatted_margin}</h2>
+                                        <p style="color: #6c757d; font-size: 0.8rem;">注意: 毛利率欄位不存在，使用毛利/總計金額計算</p>
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True
+                                )
+                    except Exception as e:
+                        st.error(f"計算毛利率時發生錯誤: {e}")
+                        with col2:
+                            with st.container(border=True):
+                                st.markdown(
+                                    """
+                                    <div style="text-align: center; padding: 1rem 0;">
+                                        <h3 style="font-size: 1.2rem; color: #555;">計算毛利率</h3>
+                                        <h2 style="font-size: 2rem; font-weight: bold; color: #d63384;">0.00%</h2>
+                                        <p style="color: #dc3545;">無法計算毛利率，請檢查數據格式</p>
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True
+                                )
+            except Exception as e:
+                st.error(f"計算毛利相關指標時發生錯誤: {e}")
+                col1, col2 = st.columns(2)
+                with col1:
+                    with st.container(border=True):
+                        st.markdown(
+                            """
+                            <div style="text-align: center; padding: 1rem 0;">
+                                <h3 style="font-size: 1.2rem; color: #555;">總毛利</h3>
+                                <h2 style="font-size: 2rem; font-weight: bold; color: #0d6efd;">$0.00</h2>
+                                <p style="color: #dc3545;">無法計算總毛利，請檢查數據格式</p>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+    else:
+        # If 總計金額 is not found, show an error
+        st.error("無法計算總銷售金額: 找不到總計金額欄位")
+        st.markdown("### 銷售總覽")
+        
+        with st.container(border=True):
+            st.markdown(
+                """
+                <div style="text-align: center; padding: 2rem 0;">
+                    <h2 style="font-size: 1.5rem; color: #555;">總銷售金額</h2>
+                    <h1 style="font-size: 3rem; font-weight: bold; color: #0f5132;">$0.00</h1>
+                    <p style="color: #dc3545;">無法找到總計金額欄位，請確認數據格式</p>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+        
+        # If we have profit data, show that as well (using total_amount as the base)
+        if '毛利' in order_df.columns:
+            try:
+                # Ensure the value is numeric before formatting
+                if not pd.api.types.is_numeric_dtype(order_df['毛利']):
+                    order_df['毛利'] = pd.to_numeric(order_df['毛利'], errors='coerce')
+                
+                # Use the sum of the 毛利 column for total gross profit
+                total_profit = order_df['毛利'].sum()
+                
+                # Format for display
+                formatted_profit = f"${total_profit:,.2f}" if pd.notna(total_profit) else "$0.00"
+                
+                # Display the total gross profit
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    with st.container(border=True):
+                        st.markdown(
+                            f"""
+                            <div style="text-align: center; padding: 1rem 0;">
+                                <h3 style="font-size: 1.2rem; color: #555;">總毛利</h3>
+                                <h2 style="font-size: 2rem; font-weight: bold; color: #0d6efd;">{formatted_profit}</h2>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                
+                # For profit margin, use the average of the 毛利率 column if available
+                if '毛利率' in order_df.columns:
+                    try:
+                        # Ensure the value is numeric before calculating
+                        if not pd.api.types.is_numeric_dtype(order_df['毛利率']):
+                            order_df['毛利率'] = pd.to_numeric(order_df['毛利率'], errors='coerce')
+                            
+                        # Calculate the average profit margin (remove NaN values)
+                        avg_profit_margin = order_df['毛利率'].dropna().mean()
+                        
+                        # Format for display
+                        formatted_margin = f"{avg_profit_margin:.2f}%" if pd.notna(avg_profit_margin) else "0.00%"
+                        
+                        with col2:
+                            with st.container(border=True):
+                                st.markdown(
+                                    f"""
+                                    <div style="text-align: center; padding: 1rem 0;">
+                                        <h3 style="font-size: 1.2rem; color: #555;">平均毛利率</h3>
+                                        <h2 style="font-size: 2rem; font-weight: bold; color: #d63384;">{formatted_margin}</h2>
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True
+                                )
+                    except Exception as e:
+                        st.error(f"計算平均毛利率時發生錯誤: {e}")
+                        with col2:
+                            with st.container(border=True):
+                                st.markdown(
+                                    """
+                                    <div style="text-align: center; padding: 1rem 0;">
+                                        <h3 style="font-size: 1.2rem; color: #555;">平均毛利率</h3>
+                                        <h2 style="font-size: 2rem; font-weight: bold; color: #d63384;">0.00%</h2>
+                                        <p style="color: #dc3545;">無法計算毛利率，請檢查數據格式</p>
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True
+                                )
+                else:
+                    # Calculate profit margin from 毛利 and 總計金額 if 毛利率 column is not available
+                    try:
+                        profit_margin = (total_profit / total_amount * 100) if total_amount > 0 else 0
+                        
+                        # Format for display
+                        formatted_margin = f"{profit_margin:.2f}%" if pd.notna(profit_margin) else "0.00%"
+                        
+                        with col2:
+                            with st.container(border=True):
+                                st.markdown(
+                                    f"""
+                                    <div style="text-align: center; padding: 1rem 0;">
+                                        <h3 style="font-size: 1.2rem; color: #555;">計算毛利率</h3>
+                                        <h2 style="font-size: 2rem; font-weight: bold; color: #d63384;">{formatted_margin}</h2>
+                                        <p style="color: #6c757d; font-size: 0.8rem;">注意: 毛利率欄位不存在，使用毛利/總計金額計算</p>
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True
+                                )
+                    except Exception as e:
+                        st.error(f"計算毛利率時發生錯誤: {e}")
+                        with col2:
+                            with st.container(border=True):
+                                st.markdown(
+                                    """
+                                    <div style="text-align: center; padding: 1rem 0;">
+                                        <h3 style="font-size: 1.2rem; color: #555;">計算毛利率</h3>
+                                        <h2 style="font-size: 2rem; font-weight: bold; color: #d63384;">0.00%</h2>
+                                        <p style="color: #dc3545;">無法計算毛利率，請檢查數據格式</p>
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True
+                                )
+            except Exception as e:
+                st.error(f"計算毛利相關指標時發生錯誤: {e}")
+                col1, col2 = st.columns(2)
+                with col1:
+                    with st.container(border=True):
+                        st.markdown(
+                            """
+                            <div style="text-align: center; padding: 1rem 0;">
+                                <h3 style="font-size: 1.2rem; color: #555;">總毛利</h3>
+                                <h2 style="font-size: 2rem; font-weight: bold; color: #0d6efd;">$0.00</h2>
+                                <p style="color: #dc3545;">無法計算總毛利，請檢查數據格式</p>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+
+# Top Products Section
+st.markdown("### 熱門產品銷售")
+
+# Check if we have any sales data processed
+if st.session_state.sales_data is not None:
+    # Try using the original combined data first
+    st.session_state.debug_info.append("嘗試從原始銷售數據生成熱門產品清單")
+    top_products = get_top_products(st.session_state.sales_data, n=50)
+    
+    # If that didn't work, try using the product_level data if available
+    if (top_products is None or top_products.empty) and st.session_state.processed_data['product_level'] is not None:
+        st.session_state.debug_info.append("從原始數據生成失敗，嘗試使用處理後的產品層級數據")
+        top_products = get_top_products(st.session_state.processed_data['product_level'], n=50)
+    
+    if top_products is not None and not top_products.empty:
+        st.success(f"成功找到 {len(top_products)} 項熱門產品")
+        
+        # Create container with fixed height and scrolling for table
+        with st.container(border=True):
+            # Display all columns with nicer column headers
+            column_rename = {
+                "排名": "排名",
+                "產品代號": "產品代號",
+                "產品名稱": "產品名稱",
+                "數量": "銷售數量",
+                "小計": "銷售金額(元)"
+            }
+            display_df = top_products.rename(columns=column_rename)
+            
+            # Set height of table to show all rows but be scrollable
+            st.dataframe(display_df, hide_index=True, height=600, use_container_width=True)
+    else:
+        st.warning("無法獲取熱門產品清單")
+        with st.expander("可能的原因及解決方法"):
+            st.markdown("""
+            **可能的原因:**
+            1. 產品層級的數據缺少必要欄位 (產品代號, 產品名稱, 數量, 小計)
+            2. 數據結構與預期不符
+            3. 數值欄位的格式不正確
+            
+            **解決方法:**
+            1. 確認上傳的檔案包含所有必要的產品資訊欄位
+            2. 查看除錯資訊以取得更詳細的錯誤訊息
+            3. 確認產品數據中的數量和金額欄位是數值格式
+            """)
+else:
+    st.info("請先上傳並處理銷售數據，以查看熱門產品清單。")
+
+# Monthly Comparison Section (only show when there are multiple months of data)
+if st.session_state.processed_data['monthly_summary'] is not None:
+    monthly_summary = st.session_state.processed_data['monthly_summary']
+    
+    # Check if we have multiple months to compare
+    if len(monthly_summary) > 1:
+        st.markdown("---")
+        st.markdown("### 月度銷售比較")
+        
+        # Create and display the monthly comparison table
+        comparison_table = create_monthly_comparison_table(monthly_summary)
+        if comparison_table is not None and not comparison_table.empty:
+            st.subheader("月度銷售數據比較")
+            with st.container(border=True):
+                st.dataframe(comparison_table, hide_index=True, use_container_width=True)
+        
+        # Daily sales comparison chart
+        if st.session_state.processed_data['order_level'] is not None:
+            order_df = st.session_state.processed_data['order_level']
+            daily_comparison_chart = create_monthly_comparison_chart(order_df)
+            
+            if daily_comparison_chart is not None:
+                st.subheader("每日銷售金額比較")
+                with st.container(border=True):
+                    st.plotly_chart(daily_comparison_chart, use_container_width=True)
