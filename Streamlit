@@ -1,3 +1,4 @@
+# Version 1.1: Added Daily Sales Chart
 import streamlit as st
 import pandas as pd
 import os
@@ -1357,6 +1358,132 @@ def create_monthly_comparison_table(monthly_summary):
         st.session_state.debug_info.append(f"錯誤詳情: {traceback.format_exc()}")
         return None
 
+# Version 1.1: Added Daily Sales Chart function
+def create_daily_sales_chart(order_df, selected_month=None):
+    """
+    Create a bar chart showing daily sales within a specific month.
+    
+    Args:
+        order_df: DataFrame containing order-level data with dates and amounts
+        selected_month: The month to display (format: 'YYYY-MM'), if None, uses the most recent month
+    
+    Returns:
+        A tuple containing (plotly figure object, list of available months)
+    """
+    import plotly.graph_objects as go
+    import pandas as pd
+    from datetime import datetime
+    
+    if order_df is None or order_df.empty:
+        st.warning("無法生成日銷售圖表: 訂單數據為空")
+        return None, []
+    
+    try:
+        # Check if required columns exist
+        if '銷貨日期' not in order_df.columns or '總計金額' not in order_df.columns:
+            st.warning("生成日銷售圖表失敗: 缺少銷貨日期或總計金額欄位")
+            return None, []
+        
+        # Ensure date column is datetime type
+        if not pd.api.types.is_datetime64_dtype(order_df['銷貨日期']):
+            st.session_state.debug_info.append("將銷貨日期轉換為日期時間格式以生成日銷售圖")
+            order_df['銷貨日期'] = pd.to_datetime(order_df['銷貨日期'], errors='coerce')
+        
+        # Drop rows where date conversion failed
+        order_df = order_df.dropna(subset=['銷貨日期'])
+        if order_df.empty:
+            st.warning("日期轉換後沒有有效的數據")
+            return None, []
+
+        # Extract year-month and day for grouping
+        order_df['年月'] = order_df['銷貨日期'].dt.strftime('%Y-%m')
+        order_df['日'] = order_df['銷貨日期'].dt.day
+        
+        # Get unique months for selection
+        months = sorted(order_df['年月'].unique(), reverse=True)
+        
+        if not months:
+            st.warning("找不到有效的月份數據")
+            return None, []
+        
+        # If no month selected or selected month not in data, use most recent
+        if selected_month is None or selected_month not in months:
+            selected_month = months[0]  # Most recent month
+        
+        # Filter data for the selected month
+        month_data = order_df[order_df['年月'] == selected_month].copy()
+        
+        if month_data.empty:
+            st.warning(f"所選月份 {selected_month} 沒有銷售數據")
+            # Return an empty chart structure but still provide months for selection
+            fig = go.Figure()
+            fig.update_layout(title=f'{selected_month} 日銷售金額 - 無數據')
+            return fig, months
+        
+        # Group by day and sum total amount
+        daily_sales = month_data.groupby('日')['總計金額'].sum().reset_index()
+        
+        # Sort by day
+        daily_sales = daily_sales.sort_values('日')
+        
+        # Create figure
+        fig = go.Figure()
+        
+        # Add bar chart
+        fig.add_trace(go.Bar(
+            x=daily_sales['日'],
+            y=daily_sales['總計金額'],
+            text=daily_sales['總計金額'].apply(lambda x: f"${x:,.2f}"),
+            textposition='auto',
+            marker_color='#0d6efd', # Bootstrap primary blue
+            hovertemplate='%{x}日: $%{y:,.2f}<extra></extra>' # Use <extra></extra> to hide trace info
+        ))
+        
+        # Calculate month total for annotation
+        month_total = daily_sales['總計金額'].sum()
+        
+        # Update layout with improved styling
+        fig.update_layout(
+            title=f'{selected_month} 日銷售金額',
+            xaxis_title='日期',
+            yaxis_title='銷售金額 (元)',
+            xaxis=dict(
+                tickmode='linear', # Ensure all days are shown
+                tick0=1,
+                dtick=1,
+                tickangle=0 # Keep labels horizontal
+            ),
+            yaxis=dict(
+                tickformat="$,.2f" # Format y-axis labels as currency
+            ),
+            height=500,
+            margin=dict(l=40, r=40, t=60, b=40), # Adjusted top margin for annotation
+            annotations=[
+                dict(
+                    x=0.5, 
+                    y=1.08, # Position above the title
+                    xref='paper', 
+                    yref='paper',
+                    text=f'月總計: ${month_total:,.2f}',
+                    showarrow=False,
+                    font=dict(size=16, color="#333")
+                )
+            ],
+            hovermode='x unified' # Show hover info for the specific day
+        )
+        
+        return fig, months
+        
+    except Exception as e:
+        st.error(f"生成日銷售圖表時發生錯誤: {e}")
+        import traceback
+        st.error(f"錯誤詳情: {traceback.format_exc()}")
+        # Return empty structure on error but provide available months if possible
+        months = []
+        if '年月' in order_df.columns:
+             months = sorted(order_df['年月'].unique(), reverse=True)
+        return None, months
+
 # --------------------------------------------------
 # 📊 STREAMLIT UI ---------------------------------
 # --------------------------------------------------
@@ -2069,3 +2196,103 @@ if st.session_state.processed_data['monthly_summary'] is not None:
                 st.subheader("每日銷售金額比較")
                 with st.container(border=True):
                     st.plotly_chart(daily_comparison_chart, use_container_width=True)
+
+# Version 1.1: Add Daily Sales Chart Section to UI
+# --------------------------------------------------
+st.markdown("---")
+st.markdown("### 日銷售圖表")
+
+# Check if order level data exists
+if st.session_state.processed_data['order_level'] is not None:
+    order_df_daily = st.session_state.processed_data['order_level'].copy() # Use a copy
+    
+    # Initial chart generation (uses most recent month by default)
+    daily_chart, available_months = create_daily_sales_chart(order_df_daily)
+    
+    # Check if we got months back (even if chart is initially empty)
+    if available_months:
+        # Add a month selector using the available months
+        selected_month = st.selectbox(
+            "選擇月份:",
+            options=available_months,
+            index=0, # Default to the most recent month
+            key="daily_sales_month_selector"
+        )
+        
+        # Regenerate chart with the selected month
+        # Pass the selected month to the function
+        daily_chart, _ = create_daily_sales_chart(order_df_daily, selected_month) 
+        
+        # Display the chart if it was generated successfully
+        if daily_chart is not None:
+            with st.container(border=True):
+                st.plotly_chart(daily_chart, use_container_width=True)
+                
+                # Add some analysis text below the chart
+                if selected_month:
+                    # --- FIX: Ensure '年月' column exists before filtering ---
+                    if '年月' not in order_df_daily.columns:
+                        st.session_state.debug_info.append("重新添加 '年月' 欄位以進行分析")
+                        if '銷貨日期' in order_df_daily.columns and pd.api.types.is_datetime64_dtype(order_df_daily['銷貨日期']):
+                             order_df_daily['年月'] = order_df_daily['銷貨日期'].dt.strftime('%Y-%m')
+                        else:
+                            st.warning("無法重新生成 '年月' 欄位進行分析，缺少有效的 '銷貨日期'")
+                            # Skip analysis if column cannot be created
+                            st.stop() 
+                    # --- End FIX ---
+
+                    # Filter data again for the selected month for analysis
+                    month_data_analysis = order_df_daily[order_df_daily['年月'] == selected_month]
+                    
+                    if not month_data_analysis.empty:
+                        # Group by day for analysis metrics
+                        # --- FIX: Ensure '日' column exists before grouping ---
+                        if '日' not in month_data_analysis.columns:
+                             st.session_state.debug_info.append("重新添加 '日' 欄位以進行分析")
+                             if '銷貨日期' in month_data_analysis.columns and pd.api.types.is_datetime64_dtype(month_data_analysis['銷貨日期']):
+                                 month_data_analysis['日'] = month_data_analysis['銷貨日期'].dt.day
+                             else:
+                                 st.warning("無法重新生成 '日' 欄位進行分析，缺少有效的 '銷貨日期'")
+                                 st.stop() # Skip analysis
+                        # --- End FIX ---
+                        daily_sales_analysis = month_data_analysis.groupby(month_data_analysis['銷貨日期'].dt.day)['總計金額'].sum()
+                        
+                        if not daily_sales_analysis.empty:
+                            max_day = daily_sales_analysis.idxmax()
+                            max_sales = daily_sales_analysis.max()
+                            avg_sales = daily_sales_analysis.mean()
+                            total_sales_month = daily_sales_analysis.sum() # Recalculate for consistency
+                            
+                            # Display metrics in columns
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric(
+                                    label="本月總銷售額", 
+                                    value=f"${total_sales_month:,.2f}"
+                                )
+                            with col2:
+                                st.metric(
+                                    label="最高銷售日", 
+                                    value=f"{max_day}日", 
+                                    delta=f"${max_sales:,.2f}",
+                                    delta_color="normal" # Use normal color for amount
+                                )
+                            with col3:
+                                st.metric(
+                                    label="平均日銷售額", 
+                                    value=f"${avg_sales:,.2f}"
+                                )
+                        else:
+                            st.info(f"{selected_month} 月份沒有有效的日銷售數據可供分析。")
+                    else:
+                         st.info(f"{selected_month} 月份沒有數據可供分析。")
+        else:
+            # Handle case where chart generation failed after selection
+             st.warning(f"無法為所選月份 {selected_month} 生成日銷售圖表。")
+
+    else:
+        # Handle case where no months were found initially
+        st.warning("無法生成日銷售圖表，找不到有效的月份數據。")
+else:
+    # Message if no order data is loaded yet
+    st.info("請先上傳並處理銷售數據，以查看日銷售圖表。")
