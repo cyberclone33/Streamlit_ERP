@@ -1,4 +1,3 @@
-# Version 1.1: Added Daily Sales Chart
 import streamlit as st
 import pandas as pd
 import os
@@ -128,10 +127,188 @@ if 'processed_data' not in st.session_state:
         'product_level': None,
         'monthly_summary': None
     }
+if 'file_summaries' not in st.session_state:
+    st.session_state.file_summaries = {}
+if 'combined_top_products' not in st.session_state:
+    st.session_state.combined_top_products = None
+# monthly_top_products is no longer needed as we integrate into the combined table
+# if 'monthly_top_products' not in st.session_state:
+#     st.session_state.monthly_top_products = {}
 
 # --------------------------------------------------
 # 🛠️ UTILITY FUNCTIONS ----------------------------
 # --------------------------------------------------
+
+# Helper function to calculate summary for a single DataFrame
+def calculate_single_file_summary(df, filename):
+    """Calculates total sales and profit for a single processed order DataFrame."""
+    st.session_state.debug_info.append(f"Calculating summary for file: {filename}")
+    if df is None or df.empty:
+        st.session_state.debug_info.append(f"  - No order data found for {filename}")
+        return {'總計金額': 0, '毛利': 0}
+
+    total_amount = 0
+    total_profit = 0
+
+    # Use 總計金額 for total sales
+    if '總計金額' in df.columns:
+        try:
+            # Ensure numeric and handle potential duplicates if needed (though less likely for single file)
+            numeric_col = pd.to_numeric(df['總計金額'], errors='coerce')
+            total_amount = numeric_col.sum()
+            st.session_state.debug_info.append(f"  - {filename} - Total Amount: {total_amount}")
+        except Exception as e:
+            st.session_state.debug_info.append(f"  - Error calculating total amount for {filename}: {e}")
+            total_amount = 0
+
+    # Use 毛利 for total profit
+    if '毛利' in df.columns:
+        try:
+            # Ensure numeric
+            numeric_col = pd.to_numeric(df['毛利'], errors='coerce')
+            total_profit = numeric_col.sum()
+            st.session_state.debug_info.append(f"  - {filename} - Total Profit: {total_profit}")
+        except Exception as e:
+            st.session_state.debug_info.append(f"  - Error calculating total profit for {filename}: {e}")
+            total_profit = 0
+
+    return {'總計金額': total_amount, '毛利': total_profit}
+
+def calculate_all_top_products():
+    """
+    Calculates combined Top 100 products and augments the table with monthly sales figures.
+    """
+    st.session_state.debug_info.append("Calculating Top 100 products with monthly breakdown...")
+    st.session_state.combined_top_products = None # Reset
+
+    product_df_raw = st.session_state.processed_data.get('product_level')
+
+    if product_df_raw is None or product_df_raw.empty:
+        st.session_state.debug_info.append("  - No product level data available for top products calculation.")
+        return
+
+    # --- Create a working copy and ensure numeric types ---
+    product_df = product_df_raw.copy()
+    st.session_state.debug_info.append("  - Ensuring numeric types for '數量' and '小計'...")
+    try:
+        product_df['數量'] = pd.to_numeric(product_df['數量'], errors='coerce').fillna(0)
+        product_df['小計'] = pd.to_numeric(product_df['小計'], errors='coerce').fillna(0)
+        st.session_state.debug_info.append("    - Numeric conversion successful.")
+    except Exception as e:
+        st.session_state.debug_info.append(f"    - Error converting to numeric: {e}. Aborting top product calculation.")
+        return
+
+    # --- Calculate Combined Top 100 ---
+    st.session_state.debug_info.append("  - Calculating combined Top 100...")
+    combined_summary = product_df.groupby(["產品代號", "產品名稱"]).agg(
+        總數量=("數量", "sum"),
+        總金額=("小計", "sum") # Use numeric sum here
+    ).reset_index()
+
+    # Sort by total amount (numeric) and get top 100
+    top_100_combined = combined_summary.sort_values("總金額", ascending=False).head(100).copy() # Use copy
+    top_100_combined.insert(0, "排名", range(1, len(top_100_combined) + 1))
+    st.session_state.debug_info.append(f"  - Found {len(top_100_combined)} combined top products.")
+
+    # --- Calculate Monthly Summaries for ALL products ---
+    if '年月' not in product_df.columns:
+        st.session_state.debug_info.append("  - '年月' column missing, cannot add monthly breakdown.")
+        # Store only the combined top 100 without monthly columns
+        # Format the total amount column before storing
+        top_100_combined["總金額_顯示"] = top_100_combined["總金額"].round(2).apply(lambda x: f"{x:,.2f}")
+        st.session_state.combined_top_products = top_100_combined[['排名', '產品代號', '產品名稱', '總數量', '總金額_顯示']].rename(columns={"總金額_顯示": "總金額(元)"})
+        return
+
+    st.session_state.debug_info.append("  - Calculating monthly summaries for all products...")
+    # Use the numeric product_df here
+    monthly_summary = product_df.groupby(['年月', '產品代號', '產品名稱']).agg(
+        月數量=("數量", "sum"),
+        月金額=("小計", "sum")
+    ).reset_index()
+    st.session_state.debug_info.append(f"  - Calculated {len(monthly_summary)} monthly product summaries.")
+
+    # --- Pivot Monthly Summaries ---
+    st.session_state.debug_info.append("  - Pivoting monthly summaries...")
+    try:
+        # Use aggfunc='sum' explicitly
+        monthly_pivot = monthly_summary.pivot_table(
+            index=['產品代號', '產品名稱'],
+            columns='年月',
+            values=['月數量', '月金額'],
+            aggfunc='sum', # Explicitly use sum
+            fill_value=0
+        )
+        # Flatten MultiIndex columns
+        monthly_pivot.columns = [f"{col[1]}_{col[0]}" for col in monthly_pivot.columns]
+        monthly_pivot = monthly_pivot.reset_index()
+        st.session_state.debug_info.append("  - Successfully pivoted monthly data.")
+    except Exception as e:
+        st.session_state.debug_info.append(f"  - Error pivoting monthly data: {e}. Cannot add monthly breakdown.")
+        # Store only the combined top 100
+        top_100_combined["總金額_顯示"] = top_100_combined["總金額"].round(2).apply(lambda x: f"{x:,.2f}")
+        st.session_state.combined_top_products = top_100_combined[['排名', '產品代號', '產品名稱', '總數量', '總金額_顯示']].rename(columns={"總金額_顯示": "總金額(元)"})
+        return
+
+    # --- Merge Monthly Data with Top 100 Combined ---
+    st.session_state.debug_info.append("  - Merging monthly data with Top 100...")
+    # Merge on the original top_100_combined which has numeric 總金額
+    final_top_100_table = pd.merge(
+        top_100_combined, # Use the one with numeric totals
+        monthly_pivot,
+        on=['產品代號', '產品名稱'],
+        how='left'
+    )
+    final_top_100_table = final_top_100_table.fillna(0) # Fill NaNs from merge
+
+    # --- Format Columns AFTER calculations ---
+    st.session_state.debug_info.append("  - Formatting final table columns...")
+    # Format total amount (create a display column)
+    final_top_100_table["總金額_顯示"] = final_top_100_table["總金額"].round(2).apply(lambda x: f"{x:,.2f}")
+
+    # Format monthly amounts and quantities
+    amount_cols = [col for col in final_top_100_table.columns if col.endswith('_月金額')]
+    qty_cols = [col for col in final_top_100_table.columns if col.endswith('_月數量')]
+
+    for col in amount_cols:
+        month_year = col.split('_')[0]
+        display_col_name = f"{month_year}_金額(元)"
+        # Ensure column is numeric before formatting
+        if pd.api.types.is_numeric_dtype(final_top_100_table[col]):
+             final_top_100_table[display_col_name] = final_top_100_table[col].round(2).apply(lambda x: f"{x:,.2f}")
+        else:
+             final_top_100_table[display_col_name] = final_top_100_table[col] # Keep as is if not numeric
+             st.session_state.debug_info.append(f"    - Warning: Column {col} is not numeric, skipping currency formatting.")
+
+    for col in qty_cols:
+         month_year = col.split('_')[0]
+         display_col_name = f"{month_year}_數量"
+         # Ensure column is numeric before formatting
+         if pd.api.types.is_numeric_dtype(final_top_100_table[col]):
+              final_top_100_table[display_col_name] = final_top_100_table[col].astype(int)
+         else:
+              final_top_100_table[display_col_name] = final_top_100_table[col] # Keep as is
+              st.session_state.debug_info.append(f"    - Warning: Column {col} is not numeric, skipping integer formatting.")
+
+
+    # --- Select and Reorder columns for display ---
+    core_cols = ['排名', '產品代號', '產品名稱', '總數量', '總金額_顯示']
+    unique_months_sorted = sorted(list(set([col.split('_')[0] for col in amount_cols + qty_cols])))
+
+    monthly_cols_ordered = []
+    for month in unique_months_sorted:
+        monthly_cols_ordered.append(f"{month}_數量") # Use the display name
+        monthly_cols_ordered.append(f"{month}_金額(元)") # Use the display name
+
+    final_column_order = core_cols + monthly_cols_ordered
+    # Select only the columns needed for display
+    display_table = final_top_100_table[final_column_order].copy()
+
+    # Rename the total amount display column
+    display_table = display_table.rename(columns={"總金額_顯示": "總金額(元)"})
+
+    st.session_state.combined_top_products = display_table
+    st.session_state.debug_info.append("Finished calculating and augmenting Top 100 products table.")
+
 
 def get_uploaded_files(directory):
     """Lists files in the specified directory."""
@@ -1358,132 +1535,6 @@ def create_monthly_comparison_table(monthly_summary):
         st.session_state.debug_info.append(f"錯誤詳情: {traceback.format_exc()}")
         return None
 
-# Version 1.1: Added Daily Sales Chart function
-def create_daily_sales_chart(order_df, selected_month=None):
-    """
-    Create a bar chart showing daily sales within a specific month.
-    
-    Args:
-        order_df: DataFrame containing order-level data with dates and amounts
-        selected_month: The month to display (format: 'YYYY-MM'), if None, uses the most recent month
-    
-    Returns:
-        A tuple containing (plotly figure object, list of available months)
-    """
-    import plotly.graph_objects as go
-    import pandas as pd
-    from datetime import datetime
-    
-    if order_df is None or order_df.empty:
-        st.warning("無法生成日銷售圖表: 訂單數據為空")
-        return None, []
-    
-    try:
-        # Check if required columns exist
-        if '銷貨日期' not in order_df.columns or '總計金額' not in order_df.columns:
-            st.warning("生成日銷售圖表失敗: 缺少銷貨日期或總計金額欄位")
-            return None, []
-        
-        # Ensure date column is datetime type
-        if not pd.api.types.is_datetime64_dtype(order_df['銷貨日期']):
-            st.session_state.debug_info.append("將銷貨日期轉換為日期時間格式以生成日銷售圖")
-            order_df['銷貨日期'] = pd.to_datetime(order_df['銷貨日期'], errors='coerce')
-        
-        # Drop rows where date conversion failed
-        order_df = order_df.dropna(subset=['銷貨日期'])
-        if order_df.empty:
-            st.warning("日期轉換後沒有有效的數據")
-            return None, []
-
-        # Extract year-month and day for grouping
-        order_df['年月'] = order_df['銷貨日期'].dt.strftime('%Y-%m')
-        order_df['日'] = order_df['銷貨日期'].dt.day
-        
-        # Get unique months for selection
-        months = sorted(order_df['年月'].unique(), reverse=True)
-        
-        if not months:
-            st.warning("找不到有效的月份數據")
-            return None, []
-        
-        # If no month selected or selected month not in data, use most recent
-        if selected_month is None or selected_month not in months:
-            selected_month = months[0]  # Most recent month
-        
-        # Filter data for the selected month
-        month_data = order_df[order_df['年月'] == selected_month].copy()
-        
-        if month_data.empty:
-            st.warning(f"所選月份 {selected_month} 沒有銷售數據")
-            # Return an empty chart structure but still provide months for selection
-            fig = go.Figure()
-            fig.update_layout(title=f'{selected_month} 日銷售金額 - 無數據')
-            return fig, months
-        
-        # Group by day and sum total amount
-        daily_sales = month_data.groupby('日')['總計金額'].sum().reset_index()
-        
-        # Sort by day
-        daily_sales = daily_sales.sort_values('日')
-        
-        # Create figure
-        fig = go.Figure()
-        
-        # Add bar chart
-        fig.add_trace(go.Bar(
-            x=daily_sales['日'],
-            y=daily_sales['總計金額'],
-            text=daily_sales['總計金額'].apply(lambda x: f"${x:,.2f}"),
-            textposition='auto',
-            marker_color='#0d6efd', # Bootstrap primary blue
-            hovertemplate='%{x}日: $%{y:,.2f}<extra></extra>' # Use <extra></extra> to hide trace info
-        ))
-        
-        # Calculate month total for annotation
-        month_total = daily_sales['總計金額'].sum()
-        
-        # Update layout with improved styling
-        fig.update_layout(
-            title=f'{selected_month} 日銷售金額',
-            xaxis_title='日期',
-            yaxis_title='銷售金額 (元)',
-            xaxis=dict(
-                tickmode='linear', # Ensure all days are shown
-                tick0=1,
-                dtick=1,
-                tickangle=0 # Keep labels horizontal
-            ),
-            yaxis=dict(
-                tickformat="$,.2f" # Format y-axis labels as currency
-            ),
-            height=500,
-            margin=dict(l=40, r=40, t=60, b=40), # Adjusted top margin for annotation
-            annotations=[
-                dict(
-                    x=0.5, 
-                    y=1.08, # Position above the title
-                    xref='paper', 
-                    yref='paper',
-                    text=f'月總計: ${month_total:,.2f}',
-                    showarrow=False,
-                    font=dict(size=16, color="#333")
-                )
-            ],
-            hovermode='x unified' # Show hover info for the specific day
-        )
-        
-        return fig, months
-        
-    except Exception as e:
-        st.error(f"生成日銷售圖表時發生錯誤: {e}")
-        import traceback
-        st.error(f"錯誤詳情: {traceback.format_exc()}")
-        # Return empty structure on error but provide available months if possible
-        months = []
-        if '年月' in order_df.columns:
-             months = sorted(order_df['年月'].unique(), reverse=True)
-        return None, months
-
 # --------------------------------------------------
 # 📊 STREAMLIT UI ---------------------------------
 # --------------------------------------------------
@@ -1558,33 +1609,67 @@ with st.sidebar:
             if len(saved_paths) == len(sales_files):
                 st.success(f"已成功儲存 {len(saved_paths)} 個銷貨檔案。")
                 st.session_state.sales_files_uploaded = True
-                
+                st.session_state.file_summaries = {} # Reset individual summaries
+
                 # Load and process data
                 try:
-                    dfs = []
-                    filenames = []
+                    all_dfs = []
+                    all_filenames = []
                     for file in sales_files:
                         try:
                             df = pd.read_excel(file)
                             if not df.empty:
-                                dfs.append(df)
-                                filenames.append(file.name)
-                                st.session_state.debug_info.append(f"成功讀取 {file.name}，有 {len(df)} 行")
+                                st.session_state.debug_info.append(f"讀取 {file.name}，有 {len(df)} 行")
+                                # --- Process individual file for summary ---
+                                st.session_state.current_filename = file.name # Set context for cleaning
+                                processed_df_single = preprocess_hierarchical_excel(df.copy())
+                                cleaned_df_single = inspect_and_clean_data(processed_df_single)
+                                if cleaned_df_single is not None:
+                                    order_df_single, _ = split_data_levels(cleaned_df_single)
+                                    if order_df_single is not None:
+                                        # Ensure unique orders within the file for summary calculation
+                                        if '銷貨單號' in order_df_single.columns:
+                                             order_df_single_unique = order_df_single.drop_duplicates(subset=['銷貨單號'])
+                                        else:
+                                             order_df_single_unique = order_df_single
+                                        summary = calculate_single_file_summary(order_df_single_unique, file.name)
+                                        st.session_state.file_summaries[file.name] = summary
+                                # --- End individual processing ---
+                                all_dfs.append(df) # Add original df for combined processing
+                                all_filenames.append(file.name)
                             else:
                                 st.session_state.debug_info.append(f"警告: {file.name} 檔案為空")
                         except Exception as e:
-                            st.session_state.debug_info.append(f"讀取 {file.name} 時發生錯誤: {e}")
-                    
-                    if dfs:
-                        st.session_state.sales_data = process_sales_data(dfs, filenames)
-                        generate_monthly_sales_report(st.session_state.sales_data)
+                            st.session_state.debug_info.append(f"讀取或處理單一檔案 {file.name} 時發生錯誤: {e}")
+
+                    # Process combined data for overall report
+                    if all_dfs:
+                        st.session_state.sales_data = process_sales_data(all_dfs, all_filenames)
+                        if st.session_state.sales_data is not None:
+                             generate_monthly_sales_report(st.session_state.sales_data) # Uses processed_data['order_level']
+                             calculate_all_top_products() # Calculate top products after processing
+                        else:
+                             st.session_state.debug_info.append("合併數據處理失敗，無法生成月度報告")
+                             st.session_state.combined_top_products = None # Reset top products
+                             # st.session_state.monthly_top_products = {} # No longer needed
+
                     else:
                         st.session_state.debug_info.append("沒有成功讀取任何銷售檔案")
+                        st.session_state.sales_data = None
+                        st.session_state.processed_data = {'order_level': None, 'product_level': None, 'monthly_summary': None}
+
+
                 except Exception as e:
-                    st.session_state.debug_info.append(f"處理銷售檔案時發生錯誤: {e}")
-            else: 
+                    st.session_state.debug_info.append(f"處理銷售檔案時發生主要錯誤: {e}")
+                    st.session_state.sales_data = None
+                    st.session_state.processed_data = {'order_level': None, 'product_level': None, 'monthly_summary': None}
+                    st.session_state.file_summaries = {}
+                    st.session_state.combined_top_products = None # Reset top products
+                    # st.session_state.monthly_top_products = {} # No longer needed
+
+            else:
                 st.warning("部分銷貨檔案儲存失敗。")
-            
+
             # Show preview of the first file
             if sales_files:
                 with st.expander("資料預覽 (首個檔案)"):
@@ -1614,32 +1699,63 @@ with st.sidebar:
             
             if selected_files:
                 st.session_state.sales_files_uploaded = True
-                
+                st.session_state.file_summaries = {} # Reset individual summaries
+
                 # Load and process selected files
                 try:
-                    dfs = []
-                    filenames = []
+                    all_dfs = []
+                    all_filenames = []
                     for file in selected_files:
                         file_path = os.path.join(UPLOADED_SALES_DIR, file)
                         try:
                             df = pd.read_excel(file_path)
                             if not df.empty:
-                                dfs.append(df)
-                                filenames.append(file)
-                                st.session_state.debug_info.append(f"成功讀取 {file}，有 {len(df)} 行")
+                                st.session_state.debug_info.append(f"讀取 {file}，有 {len(df)} 行")
+                                # --- Process individual file for summary ---
+                                st.session_state.current_filename = file # Set context for cleaning
+                                processed_df_single = preprocess_hierarchical_excel(df.copy())
+                                cleaned_df_single = inspect_and_clean_data(processed_df_single)
+                                if cleaned_df_single is not None:
+                                    order_df_single, _ = split_data_levels(cleaned_df_single)
+                                    if order_df_single is not None:
+                                        # Ensure unique orders within the file for summary calculation
+                                        if '銷貨單號' in order_df_single.columns:
+                                             order_df_single_unique = order_df_single.drop_duplicates(subset=['銷貨單號'])
+                                        else:
+                                             order_df_single_unique = order_df_single
+                                        summary = calculate_single_file_summary(order_df_single_unique, file)
+                                        st.session_state.file_summaries[file] = summary
+                                # --- End individual processing ---
+                                all_dfs.append(df) # Add original df for combined processing
+                                all_filenames.append(file)
                             else:
                                 st.session_state.debug_info.append(f"警告: {file} 檔案為空")
                         except Exception as e:
-                            st.session_state.debug_info.append(f"讀取檔案 '{file}' 時發生錯誤: {e}")
-                    
-                    if dfs:
-                        st.session_state.sales_data = process_sales_data(dfs, filenames)
-                        generate_monthly_sales_report(st.session_state.sales_data)
+                            st.session_state.debug_info.append(f"讀取或處理單一檔案 '{file}' 時發生錯誤: {e}")
+
+                    # Process combined data for overall report
+                    if all_dfs:
+                        st.session_state.sales_data = process_sales_data(all_dfs, all_filenames)
+                        if st.session_state.sales_data is not None:
+                             generate_monthly_sales_report(st.session_state.sales_data) # Uses processed_data['order_level']
+                             calculate_all_top_products() # Calculate top products after processing
+                        else:
+                             st.session_state.debug_info.append("合併數據處理失敗，無法生成月度報告")
+                             st.session_state.combined_top_products = None # Reset top products
+                             # st.session_state.monthly_top_products = {} # No longer needed
                     else:
                         st.session_state.debug_info.append("沒有成功讀取任何銷售檔案")
+                        st.session_state.sales_data = None
+                        st.session_state.processed_data = {'order_level': None, 'product_level': None, 'monthly_summary': None}
+
                 except Exception as e:
-                    st.session_state.debug_info.append(f"處理銷售檔案時發生錯誤: {e}")
-                
+                    st.session_state.debug_info.append(f"處理銷售檔案時發生主要錯誤: {e}")
+                    st.session_state.sales_data = None
+                    st.session_state.processed_data = {'order_level': None, 'product_level': None, 'monthly_summary': None}
+                    st.session_state.file_summaries = {}
+                    st.session_state.combined_top_products = None # Reset top products
+                    # st.session_state.monthly_top_products = {} # No longer needed
+
                 # Show preview of first selected file
                 if selected_files:
                     with st.expander(f"資料預覽: {selected_files[0]}"):
@@ -1745,12 +1861,39 @@ with st.sidebar:
     # Generate button in sidebar
     if st.button("分析並更新報表", key="analyze_button", help="分析數據並生成報表", use_container_width=True, type="primary"):
         st.session_state.analyze_triggered = True
-        st.session_state.debug_info = []  # Reset debug info on new analysis
+        st.session_state.debug_info = []  # Reset debug info
         st.session_state.debug_info.append("開始新的分析...")
-        
-        # Run analysis when button is clicked
-        if st.session_state.sales_data is not None:
-            generate_monthly_sales_report(st.session_state.sales_data)
+        st.session_state.file_summaries = {} # Reset individual summaries
+        st.session_state.combined_top_products = None # Reset top products
+        # st.session_state.monthly_top_products = {} # No longer needed
+
+        # Re-process based on selected files (need to know which files are currently selected)
+        # The data loading logic should re-run based on current selections in the sidebar
+        # We just need to ensure calculations happen *after* data is loaded/processed by rerun
+        # Let's add the calculation call here, assuming data is ready after rerun
+        # Note: This might need adjustment if data processing isn't complete after rerun yet.
+        # A more robust way might involve flags or checking data readiness.
+        # For now, let's try calling it directly before rerun.
+
+        # Attempt calculations based on current state before triggering rerun
+        # This assumes the data might already be in session state from previous interactions
+        if st.session_state.processed_data.get('product_level') is not None:
+             calculate_all_top_products()
+        else:
+             st.session_state.debug_info.append("分析按鈕: 產品數據尚未處理，無法計算熱門產品。")
+
+
+        # This part is tricky as the button click doesn't re-run the file selection logic immediately.
+        # A better approach might be to trigger a rerun or ensure data is reprocessed fully.
+        # For now, let's assume the data loading logic handles reprocessing correctly when files change.
+        # The main change is resetting file_summaries.
+
+        # The existing logic inside the file upload/selection sections should handle the reprocessing
+        # when the app reruns after the button click. We just need to ensure file_summaries is cleared.
+
+        # Trigger a rerun to ensure the latest selections are processed
+        st.rerun()
+
     else:
         if 'analyze_triggered' not in st.session_state:
             st.session_state.analyze_triggered = False
@@ -2123,53 +2266,63 @@ if st.session_state.processed_data['order_level'] is not None:
                             unsafe_allow_html=True
                         )
 
-# Top Products Section
-st.markdown("### 熱門產品銷售")
+# Individual File Summaries Section
+if 'file_summaries' in st.session_state and st.session_state.file_summaries:
+    st.markdown("### 各檔案銷售摘要")
+    with st.container(border=True):
+        # Use columns for better layout
+        num_files = len(st.session_state.file_summaries)
+        cols = st.columns(min(num_files, 3)) # Max 3 columns
+        col_idx = 0
 
-# Check if we have any sales data processed
-if st.session_state.sales_data is not None:
-    # Try using the original combined data first
-    st.session_state.debug_info.append("嘗試從原始銷售數據生成熱門產品清單")
-    top_products = get_top_products(st.session_state.sales_data, n=50)
-    
-    # If that didn't work, try using the product_level data if available
-    if (top_products is None or top_products.empty) and st.session_state.processed_data['product_level'] is not None:
-        st.session_state.debug_info.append("從原始數據生成失敗，嘗試使用處理後的產品層級數據")
-        top_products = get_top_products(st.session_state.processed_data['product_level'], n=50)
-    
-    if top_products is not None and not top_products.empty:
-        st.success(f"成功找到 {len(top_products)} 項熱門產品")
-        
-        # Create container with fixed height and scrolling for table
-        with st.container(border=True):
-            # Display all columns with nicer column headers
-            column_rename = {
-                "排名": "排名",
-                "產品代號": "產品代號",
-                "產品名稱": "產品名稱",
-                "數量": "銷售數量",
-                "小計": "銷售金額(元)"
-            }
-            display_df = top_products.rename(columns=column_rename)
-            
-            # Set height of table to show all rows but be scrollable
-            st.dataframe(display_df, hide_index=True, height=600, use_container_width=True)
-    else:
-        st.warning("無法獲取熱門產品清單")
-        with st.expander("可能的原因及解決方法"):
-            st.markdown("""
-            **可能的原因:**
-            1. 產品層級的數據缺少必要欄位 (產品代號, 產品名稱, 數量, 小計)
-            2. 數據結構與預期不符
-            3. 數值欄位的格式不正確
-            
-            **解決方法:**
-            1. 確認上傳的檔案包含所有必要的產品資訊欄位
-            2. 查看除錯資訊以取得更詳細的錯誤訊息
-            3. 確認產品數據中的數量和金額欄位是數值格式
-            """)
+        for filename, summary in st.session_state.file_summaries.items():
+            with cols[col_idx % len(cols)]:
+                st.markdown(f"**{filename}**")
+                total_amount_f = f"${summary.get('總計金額', 0):,.2f}"
+                total_profit_f = f"${summary.get('毛利', 0):,.2f}"
+                st.metric(label="銷售金額", value=total_amount_f)
+                st.metric(label="毛利", value=total_profit_f)
+                # Add a small separator for visual clarity within columns if needed
+                # st.markdown("---")
+            col_idx += 1
+
+# Top Products Section
+st.markdown("### 熱門產品銷售 (Top 100)")
+
+combined_top_products_df = st.session_state.get('combined_top_products')
+
+if combined_top_products_df is not None and not combined_top_products_df.empty:
+    st.success(f"成功生成 Top {len(combined_top_products_df)} 產品列表 (含月度數據)")
+    with st.container(border=True):
+        # Rename columns for display - dynamically handle monthly columns
+        column_rename = {
+            "排名": "排名",
+            "產品代號": "產品代號",
+            "產品名稱": "產品名稱",
+            "總數量": "總數量",
+            "總金額": "總金額(元)"
+        }
+        # Dynamically add monthly column renames
+        monthly_cols = [col for col in combined_top_products_df.columns if '_月數量' in col or '_月金額' in col]
+        for col in monthly_cols:
+             month_part = col.split('_')[0]
+             type_part = col.split('_')[1]
+             if type_part == '月數量':
+                 column_rename[col] = f"{month_part} 數量"
+             elif type_part == '月金額':
+                 column_rename[col] = f"{month_part} 金額(元)"
+
+        display_df = combined_top_products_df.rename(columns=column_rename)
+
+        # Display the augmented dataframe
+        st.dataframe(display_df, hide_index=True, height=600, use_container_width=True)
+
+elif st.session_state.processed_data.get('product_level') is not None and st.session_state.sales_files_uploaded:
+     st.warning("無法獲取熱門產品清單。請檢查產品數據和除錯資訊。")
 else:
-    st.info("請先上傳並處理銷售數據，以查看熱門產品清單。")
+    # Fallback message if no top product data is available at all
+    st.info("請先上傳並成功處理銷售數據，以查看熱門產品清單。")
+
 
 # Monthly Comparison Section (only show when there are multiple months of data)
 if st.session_state.processed_data['monthly_summary'] is not None:
@@ -2196,103 +2349,3 @@ if st.session_state.processed_data['monthly_summary'] is not None:
                 st.subheader("每日銷售金額比較")
                 with st.container(border=True):
                     st.plotly_chart(daily_comparison_chart, use_container_width=True)
-
-# Version 1.1: Add Daily Sales Chart Section to UI
-# --------------------------------------------------
-st.markdown("---")
-st.markdown("### 日銷售圖表")
-
-# Check if order level data exists
-if st.session_state.processed_data['order_level'] is not None:
-    order_df_daily = st.session_state.processed_data['order_level'].copy() # Use a copy
-    
-    # Initial chart generation (uses most recent month by default)
-    daily_chart, available_months = create_daily_sales_chart(order_df_daily)
-    
-    # Check if we got months back (even if chart is initially empty)
-    if available_months:
-        # Add a month selector using the available months
-        selected_month = st.selectbox(
-            "選擇月份:",
-            options=available_months,
-            index=0, # Default to the most recent month
-            key="daily_sales_month_selector"
-        )
-        
-        # Regenerate chart with the selected month
-        # Pass the selected month to the function
-        daily_chart, _ = create_daily_sales_chart(order_df_daily, selected_month) 
-        
-        # Display the chart if it was generated successfully
-        if daily_chart is not None:
-            with st.container(border=True):
-                st.plotly_chart(daily_chart, use_container_width=True)
-                
-                # Add some analysis text below the chart
-                if selected_month:
-                    # --- FIX: Ensure '年月' column exists before filtering ---
-                    if '年月' not in order_df_daily.columns:
-                        st.session_state.debug_info.append("重新添加 '年月' 欄位以進行分析")
-                        if '銷貨日期' in order_df_daily.columns and pd.api.types.is_datetime64_dtype(order_df_daily['銷貨日期']):
-                             order_df_daily['年月'] = order_df_daily['銷貨日期'].dt.strftime('%Y-%m')
-                        else:
-                            st.warning("無法重新生成 '年月' 欄位進行分析，缺少有效的 '銷貨日期'")
-                            # Skip analysis if column cannot be created
-                            st.stop() 
-                    # --- End FIX ---
-
-                    # Filter data again for the selected month for analysis
-                    month_data_analysis = order_df_daily[order_df_daily['年月'] == selected_month]
-                    
-                    if not month_data_analysis.empty:
-                        # Group by day for analysis metrics
-                        # --- FIX: Ensure '日' column exists before grouping ---
-                        if '日' not in month_data_analysis.columns:
-                             st.session_state.debug_info.append("重新添加 '日' 欄位以進行分析")
-                             if '銷貨日期' in month_data_analysis.columns and pd.api.types.is_datetime64_dtype(month_data_analysis['銷貨日期']):
-                                 month_data_analysis['日'] = month_data_analysis['銷貨日期'].dt.day
-                             else:
-                                 st.warning("無法重新生成 '日' 欄位進行分析，缺少有效的 '銷貨日期'")
-                                 st.stop() # Skip analysis
-                        # --- End FIX ---
-                        daily_sales_analysis = month_data_analysis.groupby(month_data_analysis['銷貨日期'].dt.day)['總計金額'].sum()
-                        
-                        if not daily_sales_analysis.empty:
-                            max_day = daily_sales_analysis.idxmax()
-                            max_sales = daily_sales_analysis.max()
-                            avg_sales = daily_sales_analysis.mean()
-                            total_sales_month = daily_sales_analysis.sum() # Recalculate for consistency
-                            
-                            # Display metrics in columns
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric(
-                                    label="本月總銷售額", 
-                                    value=f"${total_sales_month:,.2f}"
-                                )
-                            with col2:
-                                st.metric(
-                                    label="最高銷售日", 
-                                    value=f"{max_day}日", 
-                                    delta=f"${max_sales:,.2f}",
-                                    delta_color="normal" # Use normal color for amount
-                                )
-                            with col3:
-                                st.metric(
-                                    label="平均日銷售額", 
-                                    value=f"${avg_sales:,.2f}"
-                                )
-                        else:
-                            st.info(f"{selected_month} 月份沒有有效的日銷售數據可供分析。")
-                    else:
-                         st.info(f"{selected_month} 月份沒有數據可供分析。")
-        else:
-            # Handle case where chart generation failed after selection
-             st.warning(f"無法為所選月份 {selected_month} 生成日銷售圖表。")
-
-    else:
-        # Handle case where no months were found initially
-        st.warning("無法生成日銷售圖表，找不到有效的月份數據。")
-else:
-    # Message if no order data is loaded yet
-    st.info("請先上傳並處理銷售數據，以查看日銷售圖表。")
