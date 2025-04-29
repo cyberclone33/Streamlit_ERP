@@ -2413,44 +2413,217 @@ if 'file_summaries' in st.session_state and st.session_state.file_summaries:
             col_idx += 1
 
 # All Products Section (Changed from Top Products)
+# 產品銷售列表 (全部)
 st.markdown("### 產品銷售列表 (全部)")
 
-combined_top_products_df = st.session_state.get('combined_top_products')
-
-if combined_top_products_df is not None and not combined_top_products_df.empty:
-    st.success(f"成功生成 {len(combined_top_products_df)} 項產品列表 (含月度數據)") # Changed message
-    with st.container(border=True):
-        # Rename columns for display - dynamically handle monthly columns
-        column_rename = {
-            "排名": "排名",
-            "產品代號": "產品代號",
-            "產品名稱": "產品名稱",
-            "廠商簡稱": "廠商",  # Added mapping for supplier
-            "庫存": "庫存",      # Added mapping for inventory
-            "總數量": "總數量",
-            "總金額": "總金額(元)"
-        }
-        # Dynamically add monthly column renames
-        monthly_cols = [col for col in combined_top_products_df.columns if '_月數量' in col or '_月金額' in col]
-        for col in monthly_cols:
-             month_part = col.split('_')[0]
-             type_part = col.split('_')[1]
-             if type_part == '月數量':
-                 column_rename[col] = f"{month_part} 數量"
-             elif type_part == '月金額':
-                 column_rename[col] = f"{month_part} 金額(元)"
-
-        display_df = combined_top_products_df.rename(columns=column_rename)
-
-        # Display the augmented dataframe
-        st.dataframe(display_df, hide_index=True, height=600, use_container_width=True)
-
-elif st.session_state.processed_data.get('product_level') is not None and st.session_state.sales_files_uploaded:
-     st.warning("無法獲取產品銷售清單。請檢查產品數據和除錯資訊。") # Changed message
-else:
-    # Fallback message if no product data is available at all
-    st.info("請先上傳並成功處理銷售數據，以查看產品銷售清單。") # Changed message
-
+try:
+    # 檢查是否有 BC 資料
+    if 'bc_data' in st.session_state and st.session_state.bc_data is not None:
+        bc_data = st.session_state.bc_data.copy()
+        
+        # 從 BC 資料創建基本產品列表
+        all_products = bc_data[['產品代號', '產品名稱']].copy()
+        
+        # 處理庫存欄位，確保為數字類型
+        if '數量' in bc_data.columns:
+            all_products['庫存'] = bc_data['數量'].apply(
+                lambda x: str(x).replace(',', '') if isinstance(x, str) else x
+            )
+            all_products['庫存'] = pd.to_numeric(all_products['庫存'], errors='coerce').fillna(0).astype(int)
+        else:
+            all_products['庫存'] = 0
+        
+        # 處理供應商欄位
+        if '廠商簡稱' in bc_data.columns:
+            all_products['廠商簡稱'] = bc_data['廠商簡稱'].fillna('N/A')
+        else:
+            all_products['廠商簡稱'] = 'N/A'
+        
+        # 初始化銷售數據欄位（確保為數字類型）
+        all_products['銷售數量'] = 0
+        all_products['銷售金額'] = 0.0
+        
+        # 處理銷售數據（如果有）
+        if 'product_level' in st.session_state.processed_data and st.session_state.processed_data['product_level'] is not None:
+            product_df = st.session_state.processed_data['product_level'].copy()
+            
+            # 確保數值欄位為數字類型
+            product_df['數量'] = pd.to_numeric(product_df['數量'], errors='coerce').fillna(0)
+            product_df['小計'] = pd.to_numeric(product_df['小計'], errors='coerce').fillna(0)
+            
+            # 計算各產品銷售總計
+            sales_summary = product_df.groupby('產品代號').agg({
+                '數量': 'sum',
+                '小計': 'sum'
+            }).reset_index()
+            
+            # 重命名欄位
+            sales_summary.rename(columns={
+                '數量': '銷售數量',
+                '小計': '銷售金額'
+            }, inplace=True)
+            
+            # 合併銷售數據
+            all_products = pd.merge(
+                all_products,
+                sales_summary,
+                on='產品代號',
+                how='left'
+            )
+            
+            # 處理合併後的欄位（確保沒有重複欄位問題）
+            if '銷售數量_x' in all_products.columns:
+                # 有重複欄位時的處理
+                all_products['銷售數量'] = all_products['銷售數量_y'].fillna(0)
+                all_products['銷售金額'] = all_products['銷售金額_y'].fillna(0)
+                
+                # 移除臨時欄位
+                cols_to_drop = [col for col in all_products.columns if col.endswith('_x') or col.endswith('_y')]
+                all_products = all_products.drop(columns=cols_to_drop)
+            else:
+                # 確保沒有空值
+                all_products['銷售數量'] = all_products['銷售數量'].fillna(0)
+                all_products['銷售金額'] = all_products['銷售金額'].fillna(0)
+            
+            # 確保數值類型正確
+            all_products['銷售數量'] = pd.to_numeric(all_products['銷售數量'], errors='coerce').fillna(0).astype(int)
+            all_products['銷售金額'] = pd.to_numeric(all_products['銷售金額'], errors='coerce').fillna(0).astype(float)
+            
+            # 處理月度數據（如果有）
+            if '年月' in product_df.columns:
+                try:
+                    # 按產品和年月分組計算
+                    monthly_sales = product_df.groupby(['產品代號', '年月']).agg({
+                        '數量': 'sum',
+                        '小計': 'sum'
+                    }).reset_index()
+                    
+                    # 重命名欄位
+                    monthly_sales.rename(columns={
+                        '數量': '月數量',
+                        '小計': '月金額'
+                    }, inplace=True)
+                    
+                    # 轉為樞紐表格式
+                    monthly_pivot = pd.pivot_table(
+                        monthly_sales,
+                        values=['月數量', '月金額'],
+                        index=['產品代號'],
+                        columns=['年月'],
+                        fill_value=0
+                    )
+                    
+                    # 扁平化欄位名稱
+                    monthly_pivot.columns = [f"{col[1]}_{col[0]}" for col in monthly_pivot.columns]
+                    monthly_pivot = monthly_pivot.reset_index()
+                    
+                    # 合併月度數據
+                    all_products = pd.merge(
+                        all_products,
+                        monthly_pivot,
+                        on='產品代號',
+                        how='left'
+                    )
+                    
+                    # 建立最終顯示用的月度欄位
+                    for col in list(all_products.columns):
+                        if '_月數量' in col:
+                            month = col.split('_')[0]
+                            # 確保為數字並填充空值
+                            all_products[col] = pd.to_numeric(all_products[col], errors='coerce').fillna(0).astype(int)
+                            # 建立顯示用欄位
+                            all_products[f"{month}_數量"] = all_products[col]
+                        elif '_月金額' in col:
+                            month = col.split('_')[0]
+                            # 確保為數字並填充空值
+                            all_products[col] = pd.to_numeric(all_products[col], errors='coerce').fillna(0).astype(float)
+                            # 建立顯示用欄位，格式化金額
+                            all_products[f"{month}_金額(元)"] = all_products[col].apply(
+                                lambda x: f"{float(x):,.2f}" if pd.notna(x) else "0.00"
+                            )
+                except Exception as e:
+                    st.warning(f"處理月度數據時發生錯誤: {str(e)}")
+        
+        # 添加格式化的金額欄位
+        all_products['銷售金額(元)'] = all_products['銷售金額'].apply(
+            lambda x: f"{float(x):,.2f}" if pd.notna(x) else "0.00"
+        )
+        
+        # 依銷售金額排序（確保數值類型正確）
+        all_products = all_products.sort_values('銷售金額', ascending=False).reset_index(drop=True)
+        
+        # 添加排名
+        all_products.insert(0, '排名', range(1, len(all_products) + 1))
+        
+        # 選擇要顯示的欄位
+        base_cols = ['排名', '產品代號', '產品名稱', '廠商簡稱', '庫存', '銷售數量', '銷售金額(元)']
+        
+        # 收集所有月度欄位
+        month_cols = []
+        for col in all_products.columns:
+            if ('_數量' in col or '_金額(元)' in col) and col not in base_cols:
+                month_cols.append(col)
+        
+        # 按月份排序
+        month_names = set()
+        for col in month_cols:
+            if '_數量' in col:
+                month_names.add(col.split('_')[0])
+        
+        sorted_month_cols = []
+        for month in sorted(list(month_names)):
+            sorted_month_cols.append(f"{month}_數量")
+            sorted_month_cols.append(f"{month}_金額(元)")
+        
+        # 確保所有欄位都存在
+        all_display_cols = base_cols + [col for col in sorted_month_cols if col in all_products.columns]
+        
+        # 創建最終顯示用的資料框
+        display_df = all_products[all_display_cols].copy()
+        
+        # 保存到 session state
+        st.session_state.combined_top_products = display_df
+        
+        # 標記未銷售產品
+        zero_sales = display_df[(display_df['銷售數量'] == 0) & (display_df['庫存'] > 0)]
+        
+        # 顯示產品表格
+        with st.container(border=True):
+            # 顯示產品總數
+            st.success(f"總計 {len(display_df)} 項產品，其中 {len(display_df[display_df['銷售數量'] > 0])} 項有銷售記錄")
+            
+            # 標示未銷售產品
+            if not zero_sales.empty:
+                st.info(f"發現 {len(zero_sales)} 個有庫存但無銷售紀錄的產品")
+                display_df.loc[(display_df['銷售數量'] == 0) & (display_df['庫存'] > 0), '產品名稱'] += ' ⚠️ 未銷售'
+            
+            # 定義高亮函數
+            def highlight_zero_sales(row):
+                if row['銷售數量'] == 0 and row['庫存'] > 0:
+                    return ['background-color: #FFEFDB' for _ in range(len(row))]
+                else:
+                    return ['background-color: transparent' for _ in range(len(row))]
+            
+            # 顯示資料表
+            st.dataframe(
+                display_df.style.apply(highlight_zero_sales, axis=1),
+                hide_index=True,
+                height=600,
+                use_container_width=True
+            )
+    else:
+        st.warning("請先上傳 BC 產品資料，才能顯示完整產品列表")
+        
+        # 顯示原有的產品列表（如果有）
+        original_df = st.session_state.get('combined_top_products')
+        if original_df is not None and not original_df.empty:
+            st.info("顯示原始產品列表（僅含銷售記錄）")
+            with st.container(border=True):
+                st.dataframe(original_df, hide_index=True, height=600, use_container_width=True)
+except Exception as e:
+    st.error(f"處理產品資料時發生錯誤: {str(e)}")
+    import traceback
+    st.error(traceback.format_exc())
 
 # Monthly Comparison Section (only show when there are multiple months of data)
 if st.session_state.processed_data['monthly_summary'] is not None:
