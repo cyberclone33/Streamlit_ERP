@@ -1,0 +1,39 @@
+# Claude settings
+**/.claude/settings.local.json
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Uploaded data files
+uploads/
+bc  products/*.xlsx
+sales data/*.xlsx
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Local configuration
+.env
+.streamlit/
