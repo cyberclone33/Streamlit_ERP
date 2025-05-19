@@ -565,9 +565,201 @@ def display_bc_products_dashboard(df, file_date):
         # Product details table with sorting
         st.subheader("產品明細表")
         
+        # Check if we should add sales data
+        add_sales_data = st.checkbox("加入銷售資料", value=True, help="加入銷貨單產品的銷售數量、單價和小計")
+        
+        # Enhanced dataframe with sales data if requested
+        enhanced_df = df.copy()
+        
+        if add_sales_data:
+            # Get sales data to integrate with product data
+            try:
+                # 取得銷貨單資料目錄
+                sales_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sales data")
+                
+                # 檢查目錄是否存在
+                if not os.path.exists(sales_data_dir):
+                    st.warning("無法找到銷貨單資料目錄")
+                else:
+                    # 獲取排序後的檔案（最新的在前面）
+                    sales_files = get_sorted_files(sales_data_dir)
+                    
+                    if not sales_files:
+                        st.warning("無法找到銷貨單資料檔案")
+                    else:
+                        # 建立檔案選項字典，用於更友好的顯示名稱
+                        file_options = {extract_date_from_filename(file): file for file in sales_files}
+                        
+                        # 選擇單個或多個銷售資料檔案
+                        analysis_mode = st.radio(
+                            "選擇銷售資料範圍:",
+                            ["使用最新銷售資料", "選擇單個銷售期間", "選擇多個銷售期間"],
+                            index=0,
+                            horizontal=True
+                        )
+                        
+                        with st.spinner("正在載入銷售資料..."): 
+                            # 根據選擇的模式決定要載入的銷售資料
+                            if analysis_mode == "使用最新銷售資料":
+                                # 使用最新的銷售檔案
+                                selected_files = [sales_files[0]]
+                                st.info(f"使用最新銷售資料: {extract_date_from_filename(sales_files[0])}")
+                                
+                            elif analysis_mode == "選擇單個銷售期間":
+                                # 單個檔案選擇
+                                selected_period = st.selectbox(
+                                    "選擇銷售資料期間:",
+                                    options=list(file_options.keys())
+                                )
+                                selected_files = [file_options[selected_period]]
+                                st.info(f"已選擇 {selected_period} 期間的銷售資料")
+                                
+                            else:  # 選擇多個銷售期間
+                                # 多選檔案
+                                selected_periods = st.multiselect(
+                                    "選擇多個銷售期間 (按住Ctrl或⌘鍵可多選):",
+                                    options=list(file_options.keys()),
+                                    default=[list(file_options.keys())[0]]  # 預設選擇第一個
+                                )
+                                
+                                if not selected_periods:
+                                    st.warning("請至少選擇一個銷售期間")
+                                else:
+                                    selected_files = [file_options[period] for period in selected_periods]
+                                    st.info(f"已選擇 {len(selected_files)} 個期間的銷售資料")
+                            
+                            # 載入所有選定的銷售數據並合併
+                            sales_dfs = []
+                            
+                            # 如果選擇了多個檔案且數量大於1，顯示處理進度條
+                            if len(selected_files) > 1:
+                                progress_bar = st.progress(0)
+                                progress_counter = 0
+                                total_files = len(selected_files)
+                            else:
+                                progress_bar = None
+                            
+                            # 載入所有選定的檔案
+                            for i, file in enumerate(selected_files):
+                                try:
+                                    file_path = os.path.join(sales_data_dir, file)
+                                    
+                                    # 嘗試使用銷售模組進行載入
+                                    try:
+                                        import sales
+                                        file_df = sales.load_data(file_path)
+                                    except Exception:
+                                        # 直接讀取 Excel 作為備用方案
+                                        file_df = pd.read_excel(file_path)
+                                    
+                                    sales_dfs.append(file_df)
+                                    
+                                    # 更新進度條（如果有）
+                                    if progress_bar:
+                                        progress_counter += 1
+                                        progress_bar.progress(progress_counter/total_files)
+                                        
+                                except Exception as e:
+                                    st.warning(f"處理檔案 {file} 時出錯: {str(e)}")
+                            
+                            # 完成進度（如果有進度條）
+                            if progress_bar:
+                                progress_bar.progress(1.0)
+                            
+                            # 合併所有銷售資料
+                            if sales_dfs:
+                                combined_sales_df = pd.concat(sales_dfs, ignore_index=True)
+                                
+                                # 轉換數值欄位
+                                numeric_cols = ['數量', '小計', '成本總值']
+                                for col in numeric_cols:
+                                    if col in combined_sales_df.columns:
+                                        if combined_sales_df[col].dtype == 'object':
+                                            combined_sales_df[col] = combined_sales_df[col].astype(str).str.replace(',', '')
+                                            combined_sales_df[col] = pd.to_numeric(combined_sales_df[col], errors='coerce')
+                                
+                                # 轉換單價欄位
+                                if '單價' in combined_sales_df.columns:
+                                    if combined_sales_df['單價'].dtype == 'object':
+                                        combined_sales_df['單價'] = combined_sales_df['單價'].astype(str).str.replace(',', '')
+                                        combined_sales_df['單價'] = pd.to_numeric(combined_sales_df['單價'], errors='coerce')
+                                
+                                # 建立產品銷售摘要
+                                agg_dict = {}
+                                if '產品名稱' in combined_sales_df.columns:
+                                    agg_dict['產品名稱'] = 'first'  # 取第一個產品名稱
+                                if '數量' in combined_sales_df.columns:
+                                    agg_dict['數量'] = 'sum'        # 合計數量
+                                if '單位' in combined_sales_df.columns:
+                                    agg_dict['單位'] = 'first'      # 取第一個單位
+                                if '單價' in combined_sales_df.columns:
+                                    agg_dict['單價'] = 'mean'       # 平均單價
+                                if '小計' in combined_sales_df.columns:
+                                    agg_dict['小計'] = 'sum'        # 合計小計
+                                if '成本總值' in combined_sales_df.columns:
+                                    agg_dict['成本總值'] = 'sum'     # 合計成本總值
+                                
+                                # 只有在產品代號欄位存在且有聚合內容時進行分組
+                                if '產品代號' in combined_sales_df.columns and agg_dict:
+                                    product_summary = combined_sales_df.groupby(['產品代號'], as_index=False).agg(agg_dict)
+                                    
+                                    # 安全計算單價（數量）= 小計 / 數量
+                                    product_summary['單價（數量）'] = 0.0
+                                    if '數量' in product_summary.columns and '小計' in product_summary.columns:
+                                        mask = product_summary['數量'] > 0
+                                        if isinstance(mask, pd.Series) and mask.any():
+                                            result = (product_summary.loc[mask, '小計'] / product_summary.loc[mask, '數量']).astype('float64')
+                                            product_summary.loc[mask, '單價（數量）'] = result
+                                    
+                                    # 將銷售資料映射到產品資料
+                                    sales_data_map = {}
+                                    for _, row in product_summary.iterrows():
+                                        product_code = row['產品代號']
+                                        sales_data = {
+                                            '銷售數量': row.get('數量', 0),
+                                            '銷售單價': row.get('單價（數量）', 0),
+                                            '銷售小計': row.get('小計', 0)
+                                        }
+                                        sales_data_map[product_code] = sales_data
+                                    
+                                    # 將銷售資料添加到產品資料中
+                                    enhanced_df['銷售數量'] = enhanced_df['產品代號'].map(lambda x: sales_data_map.get(x, {}).get('銷售數量', 0))
+                                    enhanced_df['銷售單價'] = enhanced_df['產品代號'].map(lambda x: sales_data_map.get(x, {}).get('銷售單價', 0))
+                                    enhanced_df['銷售小計'] = enhanced_df['產品代號'].map(lambda x: sales_data_map.get(x, {}).get('銷售小計', 0))
+                                    
+                                    # 顯示統計信息
+                                    sales_count = (enhanced_df['銷售數量'] > 0).sum()
+                                    st.success(f"找到 {sales_count} 項有銷售記錄的產品")
+                                else:
+                                    st.warning("銷貨單資料中找不到產品代號欄位或資料不完整")
+                            else:
+                                st.warning("未能載入任何銷售資料")
+                                # 添加空的銷售欄位
+                                enhanced_df['銷售數量'] = 0
+                                enhanced_df['銷售單價'] = 0
+                                enhanced_df['銷售小計'] = 0
+            except Exception as e:
+                st.error(f"整合銷售資料時出錯: {e}")
+                # 添加空的銷售欄位
+                enhanced_df['銷售數量'] = 0
+                enhanced_df['銷售單價'] = 0
+                enhanced_df['銷售小計'] = 0
+        else:
+            # 如果不添加銷售資料，仍然添加空的銷售欄位以維持表格結構一致
+            enhanced_df['銷售數量'] = 0
+            enhanced_df['銷售單價'] = 0
+            enhanced_df['銷售小計'] = 0
+            
         # Allow user to select display columns
-        all_columns = df.columns.tolist()
-        default_columns = ['產品代號', '產品名稱', '數量', '倉庫', '單位', '成本單價', '成本總價', '安全存量', '廠商簡稱', '大類名稱', '中類名稱']
+        all_columns = enhanced_df.columns.tolist()
+        default_columns = ['產品代號', '產品名稱', '數量', '銷售數量', '單位', '成本單價', '銷售單價', '成本總價', '銷售小計']
+        
+        # 根據是否顯示銷售資料添加其他默認欄位
+        additional_columns = ['安全存量', '廠商簡稱', '大類名稱', '中類名稱']
+        for col in additional_columns:
+            if col in all_columns:
+                default_columns.append(col)
+        
         selected_columns = st.multiselect(
             "選擇顯示欄位:",
             options=all_columns,
@@ -575,9 +767,9 @@ def display_bc_products_dashboard(df, file_date):
         )
         
         if not selected_columns:
-            selected_columns = default_columns
+            selected_columns = [col for col in default_columns if col in all_columns]
         
-        # Sort options
+        # Sort options with added sales columns
         sort_options = {
             "產品代號": "產品代號",
             "產品名稱": "產品名稱",
@@ -589,6 +781,18 @@ def display_bc_products_dashboard(df, file_date):
             "成本總價 (低到高)": "成本總價_asc"
         }
         
+        # 如果啟用銷售資料，添加相關排序選項
+        if add_sales_data:
+            sales_sort_options = {
+                "銷售數量 (高到低)": "銷售數量",
+                "銷售數量 (低到高)": "銷售數量_asc",
+                "銷售單價 (高到低)": "銷售單價",
+                "銷售單價 (低到高)": "銷售單價_asc",
+                "銷售小計 (高到低)": "銷售小計",
+                "銷售小計 (低到高)": "銷售小計_asc"
+            }
+            sort_options.update(sales_sort_options)
+        
         sort_choice = st.selectbox("排序方式:", list(sort_options.keys()), index=0)
         sort_column = sort_options[sort_choice]
         
@@ -599,12 +803,50 @@ def display_bc_products_dashboard(df, file_date):
         else:
             ascending = False
         
-        # Sort and display the table
-        if sort_column in df.columns:
-            sorted_df = df.sort_values(by=sort_column, ascending=ascending)
-            st.dataframe(sorted_df[selected_columns], use_container_width=True)
+        # Sort and display the table with column configuration
+        if sort_column in enhanced_df.columns:
+            sorted_df = enhanced_df.sort_values(by=sort_column, ascending=ascending)
+            st.dataframe(
+                sorted_df[selected_columns],
+                use_container_width=True,
+                column_config={
+                    "產品代號": st.column_config.TextColumn("產品代號"),
+                    "產品名稱": st.column_config.TextColumn("產品名稱"),
+                    "數量": st.column_config.NumberColumn("庫存數量", format="%.0f"),
+                    "銷售數量": st.column_config.NumberColumn("銷售數量", format="%.0f", help="來自銷貨單的銷售數量總和"),
+                    "單位": st.column_config.TextColumn("單位"),
+                    "成本單價": st.column_config.NumberColumn("成本單價", format="%.2f"),
+                    "銷售單價": st.column_config.NumberColumn("銷售單價", format="%.2f", help="銷售小計除以銷售數量"),
+                    "成本總價": st.column_config.NumberColumn("成本總價", format="%.2f"),
+                    "銷售小計": st.column_config.NumberColumn("銷售小計", format="%.2f", help="來自銷貨單的銷售小計總和"),
+                    "安全存量": st.column_config.NumberColumn("安全存量", format="%.0f"),
+                    "廠商簡稱": st.column_config.TextColumn("廠商簡稱"),
+                    "大類名稱": st.column_config.TextColumn("大類名稱"),
+                    "中類名稱": st.column_config.TextColumn("中類名稱")
+                },
+                hide_index=True
+            )
         else:
-            st.dataframe(df[selected_columns], use_container_width=True)
+            st.dataframe(
+                enhanced_df[selected_columns],
+                use_container_width=True,
+                column_config={
+                    "產品代號": st.column_config.TextColumn("產品代號"),
+                    "產品名稱": st.column_config.TextColumn("產品名稱"),
+                    "數量": st.column_config.NumberColumn("庫存數量", format="%.0f"),
+                    "銷售數量": st.column_config.NumberColumn("銷售數量", format="%.0f", help="來自銷貨單的銷售數量總和"),
+                    "單位": st.column_config.TextColumn("單位"),
+                    "成本單價": st.column_config.NumberColumn("成本單價", format="%.2f"),
+                    "銷售單價": st.column_config.NumberColumn("銷售單價", format="%.2f", help="銷售小計除以銷售數量"),
+                    "成本總價": st.column_config.NumberColumn("成本總價", format="%.2f"),
+                    "銷售小計": st.column_config.NumberColumn("銷售小計", format="%.2f", help="來自銷貨單的銷售小計總和"),
+                    "安全存量": st.column_config.NumberColumn("安全存量", format="%.0f"),
+                    "廠商簡稱": st.column_config.TextColumn("廠商簡稱"),
+                    "大類名稱": st.column_config.TextColumn("大類名稱"),
+                    "中類名稱": st.column_config.TextColumn("中類名稱")
+                },
+                hide_index=True
+            )
 
 # Run the module when executed directly
 if __name__ == "__main__":

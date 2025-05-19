@@ -168,8 +168,10 @@ def run_integrated_analysis():
         sales_df = None
         period_display = None
     else:
-        # Load and combine data from multiple months
+        # Load data from multiple months, keeping track of which month each record belongs to
         dfs = []
+        monthly_dfs = {}  # Dictionary to store each month's dataframe
+        
         for period in selected_periods:
             file = display_options.get(period)
             
@@ -180,8 +182,20 @@ def run_integrated_analysis():
             else:
                 # File is from active directory
                 file_path = os.path.join(sales_data_dir, file)
-                
-            dfs.append(sales.load_data(file_path))
+            
+            # Load the dataframe for this period
+            period_df = sales.load_data(file_path)
+            
+            # Add a period identifier column
+            period_df['_period'] = period
+            
+            # Store in our collection
+            dfs.append(period_df)
+            monthly_dfs[period] = period_df
+        
+        # Store the monthly dataframes in session state for later use
+        st.session_state.monthly_sales_dfs = monthly_dfs
+        st.session_state.selected_periods = selected_periods
         
         # Combine all dataframes
         sales_df = pd.concat(dfs, ignore_index=True)
@@ -431,6 +445,70 @@ def display_integrated_dashboard(sales_df, period_display, bc_df, file_date):
                 ).astype('float64')  # Explicitly convert to float64
                 # Assign the result to the column
                 product_summary.loc[mask, '單價（數量）'] = result
+        
+        # Add monthly breakdowns if we have multiple periods selected
+        if hasattr(st.session_state, 'monthly_sales_dfs') and len(st.session_state.monthly_sales_dfs) > 0:
+            monthly_dfs = st.session_state.monthly_sales_dfs
+            selected_periods = st.session_state.selected_periods
+            
+            # Process each month's data separately
+            for period in selected_periods:
+                if period in monthly_dfs:
+                    period_df = monthly_dfs[period]
+                    
+                    # Create a copy and ensure numeric columns are properly converted
+                    period_products = period_df.copy()
+                    for col in numeric_cols:
+                        if col in period_products.columns:
+                            if period_products[col].dtype == 'object':
+                                period_products[col] = period_products[col].astype(str).str.replace(',', '')
+                                period_products[col] = pd.to_numeric(period_products[col], errors='coerce')
+                    
+                    # Also handle unit price for this period
+                    if '單價' in period_products.columns and period_products['單價'].dtype == 'object':
+                        period_products['單價'] = period_products['單價'].astype(str).str.replace(',', '')
+                        period_products['單價'] = pd.to_numeric(period_products['單價'], errors='coerce')
+                    
+                    # Apply product code filter if needed
+                    if product_code_filter:
+                        period_products = period_products[
+                            period_products['產品代號'].str.contains(product_code_filter, case=False, na=False)
+                        ]
+                    
+                    # Create period-specific aggregation
+                    period_agg = {}
+                    if '數量' in period_products.columns:
+                        period_agg['數量'] = 'sum'
+                    if '小計' in period_products.columns:
+                        period_agg['小計'] = 'sum'
+                    
+                    # Only proceed if we have data to aggregate
+                    if period_agg and '產品代號' in period_products.columns:
+                        try:
+                            # Create period summary
+                            period_summary = period_products.groupby(['產品代號'], as_index=False).agg(period_agg)
+                            
+                            # Rename columns to include period
+                            if '數量' in period_summary.columns:
+                                period_summary.rename(columns={'數量': f'{period} 銷售數量'}, inplace=True)
+                            if '小計' in period_summary.columns:
+                                period_summary.rename(columns={'小計': f'{period} 銷售小計'}, inplace=True)
+                            
+                            # Merge with main product summary
+                            product_summary = pd.merge(
+                                product_summary, 
+                                period_summary, 
+                                on='產品代號', 
+                                how='left'
+                            )
+                            
+                            # Fill NaN values with 0
+                            if f'{period} 銷售數量' in product_summary.columns:
+                                product_summary[f'{period} 銷售數量'].fillna(0, inplace=True)
+                            if f'{period} 銷售小計' in product_summary.columns:
+                                product_summary[f'{period} 銷售小計'].fillna(0, inplace=True)
+                        except Exception as e:
+                            st.warning(f"處理 {period} 期間的銷售數據時發生錯誤: {e}")
     else:
         # Create an empty DataFrame with expected columns if aggregation isn't possible
         product_summary = pd.DataFrame(columns=['產品代號', '產品名稱', '數量', '單位', '單價', '小計', '成本總值', '單價（數量）'])
@@ -450,8 +528,17 @@ def display_integrated_dashboard(sales_df, period_display, bc_df, file_date):
         # First convert to float, then to int to handle any non-integer values
         product_summary['庫存'] = product_summary['產品代號'].map(inventory_map).fillna(0).astype(float).astype(int)
 
-        # 準備顯示的欄位列表 (including inventory)
-        display_columns = ['產品代號', '產品名稱', '數量', '庫存', '單位', '單價', '單價（數量）', '小計', '成本總值']
+        # Prepare a list of all monthly columns
+        monthly_columns = []
+        if hasattr(st.session_state, 'selected_periods'):
+            for period in st.session_state.selected_periods:
+                if f'{period} 銷售數量' in product_summary.columns:
+                    monthly_columns.append(f'{period} 銷售數量')
+                if f'{period} 銷售小計' in product_summary.columns:
+                    monthly_columns.append(f'{period} 銷售小計')
+        
+        # 準備顯示的欄位列表 (including inventory and monthly data)
+        display_columns = ['產品代號', '產品名稱', '數量', '庫存', '單位', '單價', '單價（數量）', '小計', '成本總值'] + monthly_columns
 
         # Display the table with numeric sorting (with inventory)
         # Filter display columns to only include those that exist in the dataframe
@@ -464,7 +551,7 @@ def display_integrated_dashboard(sales_df, period_display, bc_df, file_date):
                 column_config={
                     "產品代號": st.column_config.TextColumn("產品代號"),
                     "產品名稱": st.column_config.TextColumn("產品名稱"),
-                    "數量": st.column_config.NumberColumn("銷售數量", format="%.0f"),
+                    "數量": st.column_config.NumberColumn("銷售總數量", format="%.0f"),
                     "庫存": st.column_config.NumberColumn("庫存數量", format="%.0f", help="目前庫存數量 (來自BC產品資料)"),
                     "單位": st.column_config.TextColumn("單位"),
                     "單價": st.column_config.NumberColumn(
@@ -486,7 +573,17 @@ def display_integrated_dashboard(sales_df, period_display, bc_df, file_date):
                         "成本總值 (總和)",
                         format="%.2f",
                         help="點擊可以按數值大小排序"
-                    )
+                    ),
+                    **{f"{period} 銷售數量": st.column_config.NumberColumn(
+                        f"{period} 銷售數量",
+                        format="%.0f",
+                        help=f"{period} 期間的銷售數量"
+                      ) for period in st.session_state.get('selected_periods', []) if f"{period} 銷售數量" in product_summary.columns},
+                    **{f"{period} 銷售小計": st.column_config.NumberColumn(
+                        f"{period} 銷售小計",
+                        format="%.2f",
+                        help=f"{period} 期間的銷售小計"
+                      ) for period in st.session_state.get('selected_periods', []) if f"{period} 銷售小計" in product_summary.columns}
                 },
                 hide_index=True
             )
@@ -588,9 +685,133 @@ def display_integrated_dashboard(sales_df, period_display, bc_df, file_date):
         # Display BC products detail table
         st.subheader("BC產品明細表")
         
+        # Prepare monthly columns for BC products table
+        monthly_bc_columns = []
+        if hasattr(st.session_state, 'selected_periods') and hasattr(st.session_state, 'monthly_sales_dfs'):
+            # First, process each month's data to create a mapping of product codes to monthly sales data
+            for period in st.session_state.selected_periods:
+                if period in st.session_state.monthly_sales_dfs:
+                    period_df = st.session_state.monthly_sales_dfs[period]
+                    
+                    # Process numeric columns
+                    period_products = period_df.copy()
+                    numeric_cols = ['數量', '小計']
+                    for col in numeric_cols:
+                        if col in period_products.columns:
+                            if period_products[col].dtype == 'object':
+                                period_products[col] = period_products[col].astype(str).str.replace(',', '')
+                                period_products[col] = pd.to_numeric(period_products[col], errors='coerce')
+                    
+                    # Create period-specific aggregation
+                    if '產品代號' in period_products.columns:
+                        try:
+                            # Group by product code and aggregate
+                            period_agg = {}
+                            if '數量' in period_products.columns:
+                                period_agg['數量'] = 'sum'
+                            if '小計' in period_products.columns:
+                                period_agg['小計'] = 'sum'
+                            
+                            if period_agg:
+                                period_summary = period_products.groupby(['產品代號'], as_index=False).agg(period_agg)
+                                
+                                # Create column names for this period
+                                qty_col = f'{period} 銷售數量'
+                                rev_col = f'{period} 銷售小計'
+                                
+                                # Add these columns to the BC dataframe
+                                if '數量' in period_summary.columns:
+                                    bc_df[qty_col] = bc_df['產品代號'].map(
+                                        dict(zip(period_summary['產品代號'], period_summary['數量']))
+                                    ).fillna(0)
+                                    monthly_bc_columns.append(qty_col)
+                                
+                                if '小計' in period_summary.columns:
+                                    bc_df[rev_col] = bc_df['產品代號'].map(
+                                        dict(zip(period_summary['產品代號'], period_summary['小計']))
+                                    ).fillna(0)
+                                    monthly_bc_columns.append(rev_col)
+                        except Exception as e:
+                            st.warning(f"處理BC表格的 {period} 期間銷售數據時發生錯誤: {e}")
+        
+        # Merge sales data with BC product data
+        if sales_df is not None and '產品代號' in sales_df.columns:
+            # Create sales summary if it doesn't exist yet
+            if 'product_summary' not in locals():
+                # Ensure numeric columns are properly converted to numeric before aggregation
+                df_products = sales_df.copy()
+                numeric_cols = ['數量', '小計', '成本總值']
+                for col in numeric_cols:
+                    if col in df_products.columns:
+                        if df_products[col].dtype == 'object':
+                            df_products[col] = df_products[col].astype(str).str.replace(',', '')
+                            df_products[col] = pd.to_numeric(df_products[col], errors='coerce')
+                
+                # Separate handling for unit price
+                if '單價' in df_products.columns:
+                    if df_products['單價'].dtype == 'object':
+                        df_products['單價'] = df_products['單價'].astype(str).str.replace(',', '')
+                        df_products['單價'] = pd.to_numeric(df_products['單價'], errors='coerce')
+                
+                # Create aggregation dictionary
+                agg_dict = {}
+                if '產品名稱' in df_products.columns:
+                    agg_dict['產品名稱'] = 'first'  # Take the first product name
+                if '數量' in df_products.columns:
+                    agg_dict['數量'] = 'sum'        # Sum quantities
+                if '單位' in df_products.columns:
+                    agg_dict['單位'] = 'first'      # Take the first unit
+                if '單價' in df_products.columns:
+                    agg_dict['單價'] = 'mean'       # Average price
+                if '小計' in df_products.columns:
+                    agg_dict['小計'] = 'sum'        # Sum subtotals
+                if '成本總值' in df_products.columns:
+                    agg_dict['成本總值'] = 'sum'     # Sum cost values
+                
+                # Create product summary
+                if agg_dict and '產品代號' in df_products.columns:
+                    product_summary = df_products.groupby(['產品代號'], as_index=False).agg(agg_dict)
+                    
+                    # Calculate 單價（數量）= 小計 / 數量 safely
+                    product_summary['單價（數量）'] = 0.0  # Default value as float
+                    if '數量' in product_summary.columns and '小計' in product_summary.columns:
+                        mask = product_summary['數量'] > 0
+                        if isinstance(mask, pd.Series) and mask.any():
+                            result = (product_summary.loc[mask, '小計'] / product_summary.loc[mask, '數量']).astype('float64')
+                            product_summary.loc[mask, '單價（數量）'] = result
+            
+            # Create a copy of BC dataframe to add sales data (if not already done)
+            enhanced_bc_df = bc_df.copy()
+            
+            # Add sales columns if they don't exist
+            if 'product_summary' in locals() and not product_summary.empty:
+                # Create a mapping of product codes to sales data
+                sales_data_map = {}
+                for _, row in product_summary.iterrows():
+                    product_code = row['產品代號']
+                    sales_data = {
+                        '銷售數量': row.get('數量', 0),
+                        '銷售單價': row.get('單價（數量）', 0),
+                        '銷售小計': row.get('小計', 0)
+                    }
+                    sales_data_map[product_code] = sales_data
+                
+                # Add sales columns to BC data
+                enhanced_bc_df['銷售數量'] = enhanced_bc_df['產品代號'].map(lambda x: sales_data_map.get(x, {}).get('銷售數量', 0))
+                enhanced_bc_df['銷售單價'] = enhanced_bc_df['產品代號'].map(lambda x: sales_data_map.get(x, {}).get('銷售單價', 0))
+                enhanced_bc_df['銷售小計'] = enhanced_bc_df['產品代號'].map(lambda x: sales_data_map.get(x, {}).get('銷售小計', 0))
+            else:
+                # If no sales data exists, add empty columns
+                enhanced_bc_df['銷售數量'] = 0
+                enhanced_bc_df['銷售單價'] = 0
+                enhanced_bc_df['銷售小計'] = 0
+            
+            # Use the enhanced dataframe instead of the original
+            bc_df = enhanced_bc_df
+        
         # Allow user to select display columns
         all_columns = bc_df.columns.tolist()
-        default_columns = ['產品代號', '產品名稱', '數量', '倉庫', '單位', '成本單價', '成本總價', '安全存量', '廠商簡稱', '大類名稱', '中類名稱']
+        default_columns = ['產品代號', '產品名稱', '數量', '銷售數量', '單位', '成本單價', '銷售單價', '成本總價', '銷售小計'] + monthly_bc_columns + ['安全存量', '廠商簡稱', '大類名稱', '中類名稱']
         selected_columns = st.multiselect(
             "選擇顯示欄位:",
             options=all_columns,
@@ -600,7 +821,7 @@ def display_integrated_dashboard(sales_df, period_display, bc_df, file_date):
         if not selected_columns:
             selected_columns = default_columns
         
-        # Sort options
+        # Sort options with added sales columns
         sort_options = {
             "產品代號": "產品代號",
             "產品名稱": "產品名稱",
@@ -609,8 +830,21 @@ def display_integrated_dashboard(sales_df, period_display, bc_df, file_date):
             "成本單價 (高到低)": "成本單價",
             "成本單價 (低到高)": "成本單價_asc",
             "成本總價 (高到低)": "成本總價",
-            "成本總價 (低到高)": "成本總價_asc"
+            "成本總價 (低到高)": "成本總價_asc",
+            "銷售數量 (高到低)": "銷售數量",
+            "銷售數量 (低到高)": "銷售數量_asc",
+            "銷售小計 (高到低)": "銷售小計",
+            "銷售小計 (低到高)": "銷售小計_asc"
         }
+        
+        # Add monthly columns to sort options
+        for col in monthly_bc_columns:
+            if '銷售數量' in col:
+                sort_options[f"{col} (高到低)"] = col
+                sort_options[f"{col} (低到高)"] = f"{col}_asc"
+            elif '銷售小計' in col:
+                sort_options[f"{col} (高到低)"] = col
+                sort_options[f"{col} (低到高)"] = f"{col}_asc"
         
         sort_choice = st.selectbox("排序方式:", list(sort_options.keys()), index=0)
         sort_column = sort_options[sort_choice]
@@ -622,12 +856,60 @@ def display_integrated_dashboard(sales_df, period_display, bc_df, file_date):
         else:
             ascending = False
         
-        # Sort and display the table
+        # Sort and display the table with column configuration
         if sort_column in bc_df.columns:
             sorted_df = bc_df.sort_values(by=sort_column, ascending=ascending)
-            st.dataframe(sorted_df[selected_columns], use_container_width=True)
+            st.dataframe(
+                sorted_df[selected_columns], 
+                use_container_width=True,
+                column_config={
+                    "產品代號": st.column_config.TextColumn("產品代號"),
+                    "產品名稱": st.column_config.TextColumn("產品名稱"),
+                    "數量": st.column_config.NumberColumn("庫存數量", format="%.0f"),
+                    "銷售數量": st.column_config.NumberColumn("銷售總數量", format="%.0f", help="來自銷貨單的銷售數量總和"),
+                    "單位": st.column_config.TextColumn("單位"),
+                    "成本單價": st.column_config.NumberColumn("成本單價", format="%.2f"),
+                    "銷售單價": st.column_config.NumberColumn("銷售單價", format="%.2f", help="銷售小計除以銷售數量"),
+                    "成本總價": st.column_config.NumberColumn("成本總價", format="%.2f"),
+                    "銷售小計": st.column_config.NumberColumn("銷售總額", format="%.2f", help="來自銷貨單的銷售小計總和"),
+                    "安全存量": st.column_config.NumberColumn("安全存量", format="%.0f"),
+                    "廠商簡稱": st.column_config.TextColumn("廠商簡稱"),
+                    "大類名稱": st.column_config.TextColumn("大類名稱"),
+                    "中類名稱": st.column_config.TextColumn("中類名稱"),
+                    **{col: st.column_config.NumberColumn(
+                        col,
+                        format="%.0f" if '數量' in col else "%.2f",
+                        help=f"{col.split(' ')[0]} 期間的{'銷售數量' if '數量' in col else '銷售金額'}"
+                      ) for col in monthly_bc_columns}
+                },
+                hide_index=True
+            )
         else:
-            st.dataframe(bc_df[selected_columns], use_container_width=True)
+            st.dataframe(
+                bc_df[selected_columns], 
+                use_container_width=True,
+                column_config={
+                    "產品代號": st.column_config.TextColumn("產品代號"),
+                    "產品名稱": st.column_config.TextColumn("產品名稱"),
+                    "數量": st.column_config.NumberColumn("庫存數量", format="%.0f"),
+                    "銷售數量": st.column_config.NumberColumn("銷售總數量", format="%.0f", help="來自銷貨單的銷售數量總和"),
+                    "單位": st.column_config.TextColumn("單位"),
+                    "成本單價": st.column_config.NumberColumn("成本單價", format="%.2f"),
+                    "銷售單價": st.column_config.NumberColumn("銷售單價", format="%.2f", help="銷售小計除以銷售數量"),
+                    "成本總價": st.column_config.NumberColumn("成本總價", format="%.2f"),
+                    "銷售小計": st.column_config.NumberColumn("銷售總額", format="%.2f", help="來自銷貨單的銷售小計總和"),
+                    "安全存量": st.column_config.NumberColumn("安全存量", format="%.0f"),
+                    "廠商簡稱": st.column_config.TextColumn("廠商簡稱"),
+                    "大類名稱": st.column_config.TextColumn("大類名稱"),
+                    "中類名稱": st.column_config.TextColumn("中類名稱"),
+                    **{col: st.column_config.NumberColumn(
+                        col,
+                        format="%.0f" if '數量' in col else "%.2f",
+                        help=f"{col.split(' ')[0]} 期間的{'銷售數量' if '數量' in col else '銷售金額'}"
+                      ) for col in monthly_bc_columns}
+                },
+                hide_index=True
+            )
 
 # Run the module when executed directly
 if __name__ == "__main__":

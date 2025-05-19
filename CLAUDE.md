@@ -20,6 +20,9 @@ The application consists of several key modules:
   - Can be integrated with sales data for stock level analysis
 
 - **integrated_module.py**: Combined dashboard with multiple data sources
+  - Integrates sales data with inventory information
+  - Displays monthly sales breakdown for each product
+  - Shows consolidated view with period-by-period comparison
 
 - **fixed_sales_dashboard.py**: Alternative dashboard implementation with comparison features
 
@@ -36,6 +39,8 @@ The application includes several performance optimizations:
 4. **Memory Management**: Datatype optimization to reduce memory usage for large datasets
 
 5. **Efficient Aggregations**: Optimized groupby operations with pre-filtering
+
+6. **Monthly Sales Tracking**: Period-by-period sales breakdown for better trend analysis
 
 ## Running the Application
 
@@ -61,6 +66,25 @@ python -m streamlit run integrated_module.py
 # Run fixed sales dashboard
 python -m streamlit run fixed_sales_dashboard.py
 ```
+
+## Feature Details
+
+### Monthly Sales Breakdown
+
+The integrated dashboard includes the ability to view sales data on a month-by-month basis:
+
+- **Sales Summary Table**: Shows total sales quantities and values across all selected periods
+- **Monthly Columns**: Individual columns for each selected month showing:
+  - Sales quantity for that specific month
+  - Sales revenue for that specific month
+- **BC Products Integration**: The BC products table shows both total sales figures and monthly breakdowns
+- **Sorting Options**: Tables can be sorted by any month's sales data for comparison
+
+### Filter and Selection Features
+
+- Products can be filtered by various attributes including category, vendor, and stock availability
+- Multiple sales periods can be selected for comprehensive analysis
+- Display columns can be customized to show only relevant data
 
 ## Known Issues and Solutions
 
